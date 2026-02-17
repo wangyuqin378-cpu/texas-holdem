@@ -369,6 +369,11 @@ class Game {
 
       if (this.isBettingRoundComplete()) {
         this.advancePhase();
+        // 如果 advancePhase 最终到了 SHOWDOWN（正常比牌结束），
+        // 必须返回 roundEnded 让服务器触发自动续局
+        if (this.phase === GAME_PHASES.SHOWDOWN) {
+          return { ...result, roundEnded: true };
+        }
         return { ...result, phaseChanged: true, newPhase: this.phase };
       }
 

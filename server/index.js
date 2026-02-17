@@ -82,6 +82,83 @@ function clearTurnTimer(roomId) {
   }
 }
 
+// 广播本轮结果消息
+function broadcastRoundResults(roomId, game) {
+  const lastResults = game.lastResults;
+  if (lastResults) {
+    for (const r of lastResults) {
+      if (r.winAmount > 0) {
+        broadcastMessage(roomId, `🏆 ${r.playerName} +${r.winAmount}${r.handName ? ` (${r.handName})` : ''}`, 'success');
+      }
+    }
+  }
+}
+
+// 安排下一轮（统一入口，避免重复代码）
+function scheduleNextRound(roomId, game) {
+  clearTurnTimer(roomId);
+  broadcastRoundResults(roomId, game);
+  broadcastGameState(roomId);
+
+  setTimeout(() => {
+    if (!game.prepareNextRound()) {
+      // 20轮打满 → 结算
+      broadcastMessage(roomId, '🏁 20轮结束！查看结算', 'success');
+      broadcastGameState(roomId);
+      clearTurnTimer(roomId);
+      return;
+    }
+
+    if (!game.startRound()) {
+      // startRound 失败 → 有筹码的玩家不足2人
+      // 检查是否有玩家筹码为0可以重购
+      const playersWithChips = [...game.players.values()].filter(p => p.chips > 0);
+      if (playersWithChips.length < 2) {
+        broadcastMessage(roomId, '⚠️ 有筹码的玩家不足2人，等待重购后继续', 'warning');
+        // 设置 phase 回 SHOWDOWN 这样玩家可以看到状态并重购
+        // 但不能一直卡在这，5秒后再检查一次
+        retryStartRound(roomId, game, 0);
+      }
+      broadcastGameState(roomId);
+      return;
+    }
+
+    // 正常开始下一轮
+    broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮`, 'phase');
+    const nextPlayer = game.getCurrentPlayer();
+    if (nextPlayer) {
+      broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
+    }
+    broadcastGameState(roomId);
+    startTurnTimer(roomId);
+  }, 2500);
+}
+
+// 重试开始新一轮（等待重购）
+function retryStartRound(roomId, game, attempt) {
+  if (attempt >= 6) {
+    // 30秒还没凑够人，提前结算
+    broadcastMessage(roomId, '🏁 筹码不足的玩家未重购，提前结算', 'success');
+    game.phase = GAME_PHASES.SETTLED;
+    broadcastGameState(roomId);
+    return;
+  }
+  setTimeout(() => {
+    if (game.phase === GAME_PHASES.SETTLED) return; // 已经手动重置了
+    if (game.startRound()) {
+      broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮`, 'phase');
+      const nextPlayer = game.getCurrentPlayer();
+      if (nextPlayer) {
+        broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
+      }
+      broadcastGameState(roomId);
+      startTurnTimer(roomId);
+    } else {
+      retryStartRound(roomId, game, attempt + 1);
+    }
+  }, 5000);
+}
+
 // 统一处理操作结果
 function handleActionResult(roomId, game, result, player, action) {
   let actionMsg = '';
@@ -95,46 +172,25 @@ function handleActionResult(roomId, game, result, player, action) {
   broadcastMessage(roomId, actionMsg);
 
   if (result.roundEnded) {
-    clearTurnTimer(roomId);
-
-    // 立即广播结果（不弹窗，走消息流）
-    const lastResults = game.lastResults;
-    if (lastResults) {
-      for (const r of lastResults) {
-        if (r.winAmount > 0) {
-          broadcastMessage(roomId, `🏆 ${r.playerName} +${r.winAmount}${r.handName ? ` (${r.handName})` : ''}`, 'success');
-        }
-      }
-    }
-    broadcastGameState(roomId);
-
-    // 2秒后自动开始下一轮（不需要确认）
-    setTimeout(() => {
-      if (game.prepareNextRound()) {
-        if (game.startRound()) {
-          broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮`, 'phase');
-          const nextPlayer = game.getCurrentPlayer();
-          if (nextPlayer) {
-            broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
-          }
-          broadcastGameState(roomId);
-          startTurnTimer(roomId);
-        }
-      } else {
-        broadcastMessage(roomId, '🏁 20轮结束！查看结算', 'success');
-        broadcastGameState(roomId);
-        clearTurnTimer(roomId);
-      }
-    }, 2500);
+    // 本轮结束 → 自动续局
+    scheduleNextRound(roomId, game);
+  } else if (result.phaseChanged && game.phase === GAME_PHASES.SHOWDOWN) {
+    // 兜底：advancePhase 到了 showdown 但返回的是 phaseChanged 而不是 roundEnded
+    scheduleNextRound(roomId, game);
   } else {
+    // 正常推进
     broadcastGameState(roomId);
     if (result.phaseChanged) {
-      const phaseNames = { flop: '翻牌', turn: '转牌', river: '河牌', showdown: '摊牌' };
+      const phaseNames = { flop: '翻牌', turn: '转牌', river: '河牌' };
       broadcastMessage(roomId, `--- ${phaseNames[result.newPhase] || result.newPhase} ---`, 'phase');
     }
     const nextPlayer = game.getCurrentPlayer();
     if (nextPlayer && game.phase !== GAME_PHASES.SHOWDOWN) {
       broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
+    }
+    // 正常操作阶段需要重启倒计时
+    if (result.phaseChanged) {
+      startTurnTimer(roomId);
     }
   }
 }
@@ -283,6 +339,7 @@ io.on('connection', (socket) => {
     if (!game) return;
 
     game.restartGame();
+    clearTurnTimer(roomId);
     broadcastMessage(roomId, '🔄 比赛已重置，请重新准备', 'success');
     broadcastGameState(roomId);
     if (typeof callback === 'function') callback({ success: true });
@@ -314,16 +371,26 @@ io.on('connection', (socket) => {
     const player = game.players.get(socket.id);
     const playerName = player?.name || '未知玩家';
 
+    // 记录断连前的状态
+    const wasInGame = game.isGameStarted && game.phase !== GAME_PHASES.WAITING && game.phase !== GAME_PHASES.SETTLED && game.phase !== GAME_PHASES.SHOWDOWN;
+
     game.removePlayer(socket.id);
     playerRooms.delete(socket.id);
 
     broadcastMessage(roomId, `${playerName} 离开了房间`);
-    broadcastGameState(roomId);
 
     if (game.playerCount === 0) {
       clearTurnTimer(roomId);
       rooms.delete(roomId);
       console.log(`房间 ${roomId} 已删除`);
+      return;
+    }
+
+    // 如果游戏进行中且 removePlayer 触发了 endRound（phase 变为 SHOWDOWN），需要续局
+    if (wasInGame && game.phase === GAME_PHASES.SHOWDOWN) {
+      scheduleNextRound(roomId, game);
+    } else {
+      broadcastGameState(roomId);
     }
   });
 });
