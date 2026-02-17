@@ -96,41 +96,36 @@ function handleActionResult(roomId, game, result, player, action) {
 
   if (result.roundEnded) {
     clearTurnTimer(roomId);
-    broadcastGameState(roomId);
 
+    // 立即广播结果（不弹窗，走消息流）
     const lastResults = game.lastResults;
     if (lastResults) {
       for (const r of lastResults) {
         if (r.winAmount > 0) {
-          broadcastMessage(roomId, `🏆 ${r.playerName} 赢得 ${r.winAmount} 筹码${r.handName ? ` (${r.handName})` : ''}`, 'success');
+          broadcastMessage(roomId, `🏆 ${r.playerName} +${r.winAmount}${r.handName ? ` (${r.handName})` : ''}`, 'success');
         }
       }
     }
+    broadcastGameState(roomId);
 
-    // 自动进入下一轮
+    // 2秒后自动开始下一轮（不需要确认）
     setTimeout(() => {
       if (game.prepareNextRound()) {
-        broadcastMessage(roomId, `--- 准备第 ${game.currentRound + 1}/${game.maxRounds} 轮 ---`, 'phase');
-        // 自动开始下一轮
-        setTimeout(() => {
-          if (game.startRound()) {
-            broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮开始！`, 'success');
-            const nextPlayer = game.getCurrentPlayer();
-            if (nextPlayer) {
-              broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
-            }
-            broadcastGameState(roomId);
-            startTurnTimer(roomId);
+        if (game.startRound()) {
+          broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮`, 'phase');
+          const nextPlayer = game.getCurrentPlayer();
+          if (nextPlayer) {
+            broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
           }
-        }, 1000);
+          broadcastGameState(roomId);
+          startTurnTimer(roomId);
+        }
       } else {
-        // 20轮结束，进入结算
-        broadcastMessage(roomId, '🏁 20轮比赛结束！正在结算...', 'success');
+        broadcastMessage(roomId, '🏁 20轮结束！查看结算', 'success');
         broadcastGameState(roomId);
         clearTurnTimer(roomId);
       }
-      broadcastGameState(roomId);
-    }, 4000);
+    }, 2500);
   } else {
     broadcastGameState(roomId);
     if (result.phaseChanged) {

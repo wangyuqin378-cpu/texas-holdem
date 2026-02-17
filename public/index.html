@@ -96,8 +96,9 @@
       <button id="btnRebuy" class="btn btn-secondary btn-large hidden">💰 重购 1000</button>
     </div>
 
-    <!-- 消息 -->
+    <!-- 消息（可拖拽） -->
     <div id="messageLog" class="message-log">
+      <div class="drag-handle">💬 消息 <span class="drag-hint">可拖动</span></div>
       <div id="messages" class="messages"></div>
       <div class="chat-input-row">
         <input type="text" id="chatInput" placeholder="消息..." maxlength="60">
@@ -105,15 +106,7 @@
       </div>
     </div>
 
-    <!-- 结果弹窗 -->
-    <div id="resultOverlay" class="result-overlay hidden">
-      <div class="result-content">
-        <h2 id="resultTitle"></h2>
-        <div id="resultDetails"></div>
-      </div>
-    </div>
-
-    <!-- 结算弹窗 -->
+    <!-- 结算弹窗（仅20轮结束时） -->
     <div id="settlementOverlay" class="settlement-overlay hidden">
       <div class="settlement-content">
         <h2>🏁 比赛结算</h2>

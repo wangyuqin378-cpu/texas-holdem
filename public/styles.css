@@ -220,14 +220,21 @@ input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;hei
   flex-shrink:0;display:flex;gap:10px;justify-content:center;
 }
 
-/* ===== 消息区 ===== */
+/* ===== 消息区（可拖拽） ===== */
 .message-log{
-  position:absolute;bottom:80px;left:8px;width:220px;max-height:180px;
-  background:rgba(0,0,0,.6);border-radius:8px;padding:6px;
+  position:absolute;bottom:80px;left:8px;width:220px;max-height:200px;
+  background:rgba(0,0,0,.65);border-radius:8px;padding:0 6px 6px;
   display:flex;flex-direction:column;
   -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
-  border:1px solid rgba(255,255,255,.04);z-index:20;
+  border:1px solid rgba(255,255,255,.06);z-index:20;
+  cursor:move;touch-action:none;
 }
+.drag-handle{
+  padding:5px 2px 3px;font-size:10px;color:var(--text2);font-weight:600;
+  cursor:move;display:flex;align-items:center;gap:4px;
+  border-bottom:1px solid rgba(255,255,255,.04);margin-bottom:3px;
+}
+.drag-hint{font-size:8px;color:rgba(255,255,255,.2);font-weight:400}
 .messages{flex:1;overflow-y:auto;max-height:130px;padding-right:3px}
 .messages::-webkit-scrollbar{width:2px}
 .messages::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:2px}
@@ -239,31 +246,24 @@ input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;hei
 .chat-input-row{display:flex;gap:3px;margin-top:4px}
 .chat-input-row input{flex:1;padding:5px 7px;font-size:11px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);border-radius:5px;color:var(--text);outline:none}
 
-/* ===== 结果弹窗 ===== */
-.result-overlay,.settlement-overlay{
+/* ===== 结算弹窗（仅20轮结束） ===== */
+.settlement-overlay{
   position:absolute;top:0;left:0;width:100%;height:100%;
   background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;
   z-index:100;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
   animation:fadeIn .25s;
 }
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-.result-content,.settlement-content{
+.settlement-content{
   background:var(--bg-card);border-radius:14px;padding:24px;text-align:center;
   width:min(90vw,360px);max-height:80vh;overflow-y:auto;
   box-shadow:0 8px 40px rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.06);
   animation:scaleIn .25s ease;
 }
 @keyframes scaleIn{from{transform:scale(.92);opacity:0}to{transform:scale(1);opacity:1}}
-.result-content h2,.settlement-content h2{color:var(--gold);margin-bottom:12px;font-size:20px}
+.settlement-content h2{color:var(--gold);margin-bottom:12px;font-size:20px}
 .settlement-sub{color:var(--text2);font-size:13px;margin-bottom:16px}
 
-.result-player{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;margin:3px 0;border-radius:6px;background:rgba(255,255,255,.03)}
-.result-player.winner{background:rgba(255,215,0,.08);border:1px solid rgba(255,215,0,.15)}
-.result-player-name{font-weight:600;font-size:13px}
-.result-hand{font-size:11px;color:var(--text2)}
-.result-amount{font-weight:700;color:var(--success)}
-.result-amount.lost{color:var(--danger)}
-.result-cards{display:flex;gap:2px;margin-top:3px}
 
 /* 结算表 */
 .settlement-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin:3px 0;border-radius:8px;background:rgba(255,255,255,.03)}
