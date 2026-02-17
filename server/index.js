@@ -3,6 +3,7 @@
  * - 20轮制 + 全员确认后续局
  * - 重购 + 结算
  * - 2分钟倒计时
+ * - 断线重连支持
  */
 
 const express = require('express');
@@ -16,13 +17,17 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' },
+  pingTimeout: 30000,      // 30秒无响应才判定断开（移动端切后台友好）
+  pingInterval: 10000,     // 每10秒 ping 一次
 });
 
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const rooms = new Map();
-const playerRooms = new Map();
+const playerRooms = new Map();       // socketId → roomId
 const roomTimers = new Map();
+const disconnectTimers = new Map();  // socketId → { timer, roomId, playerName }
+const DISCONNECT_TIMEOUT = 5 * 60 * 1000; // 5分钟断线保护
 
 function createRoom() {
   const roomId = uuidv4().substring(0, 6).toUpperCase();
@@ -191,6 +196,54 @@ io.on('connection', (socket) => {
     } else {
       callback({ success: false, message: result.message });
     }
+  });
+
+  // 断线重连
+  socket.on('rejoinRoom', (data, callback) => {
+    const { roomId, playerName } = data;
+    const upperRoomId = roomId.toUpperCase();
+    const game = rooms.get(upperRoomId);
+    if (!game) {
+      callback({ success: false, message: '房间不存在或已解散' });
+      return;
+    }
+
+    // 查找断线玩家（名字匹配 + 断线状态）
+    let oldPlayerId = null;
+    for (const [pid, player] of game.players) {
+      if (player.name === playerName && !player.isConnected) {
+        oldPlayerId = pid;
+        break;
+      }
+    }
+
+    if (!oldPlayerId) {
+      callback({ success: false, message: '未找到断线记录，请重新加入' });
+      return;
+    }
+
+    // 取消断线移除计时器
+    const dcInfo = disconnectTimers.get(oldPlayerId);
+    if (dcInfo) {
+      clearTimeout(dcInfo.timer);
+      disconnectTimers.delete(oldPlayerId);
+    }
+
+    // 执行重连：替换 socket ID
+    const player = game.reconnectPlayer(oldPlayerId, socket.id);
+    if (!player) {
+      callback({ success: false, message: '重连失败' });
+      return;
+    }
+
+    socket.join(upperRoomId);
+    playerRooms.set(socket.id, upperRoomId);
+    playerRooms.delete(oldPlayerId);
+
+    console.log(`玩家重连: ${playerName} (${oldPlayerId} → ${socket.id}) 房间 ${upperRoomId}`);
+    callback({ success: true, roomId: upperRoomId, seatIndex: player.seatIndex });
+    broadcastMessage(upperRoomId, `🔄 ${playerName} 重新连接`);
+    broadcastGameState(upperRoomId);
   });
 
   socket.on('quickJoin', (data, callback) => {
@@ -365,30 +418,23 @@ io.on('connection', (socket) => {
     if (!game) return;
 
     const player = game.players.get(socket.id);
-    const playerName = player?.name || '未知玩家';
+    if (!player) return;
+    const playerName = player.name;
 
-    const wasInGame = game.isGameStarted
-      && game.phase !== GAME_PHASES.WAITING
-      && game.phase !== GAME_PHASES.SETTLED
-      && game.phase !== GAME_PHASES.SHOWDOWN;
+    // 标记断线，而不是立即移除
+    const dcResult = game.markDisconnected(socket.id);
+    broadcastMessage(roomId, `⚠️ ${playerName} 断线（5分钟内可重连）`, 'warning');
 
-    game.removePlayer(socket.id);
-    playerRooms.delete(socket.id);
-
-    broadcastMessage(roomId, `${playerName} 离开了房间`);
-
-    if (game.playerCount === 0) {
+    // 检查所有已连接的玩家数量
+    const connectedPlayers = [...game.players.values()].filter(p => p.isConnected);
+    if (connectedPlayers.length === 0) {
       clearTurnTimer(roomId);
-      rooms.delete(roomId);
-      console.log(`房间 ${roomId} 已删除`);
-      return;
     }
 
-    // 如果游戏进行中且 removePlayer 触发了 endRound
-    if (wasInGame && game.phase === GAME_PHASES.SHOWDOWN) {
+    // 如果断线触发了 endRound
+    if (dcResult && dcResult.roundEnded && game.phase === GAME_PHASES.SHOWDOWN) {
       enterShowdown(roomId, game);
     } else if (game.phase === GAME_PHASES.SHOWDOWN && game.allConfirmedNext) {
-      // 离开后所有剩余玩家都已确认
       broadcastMessage(roomId, '🚀 全员确认，开始下一轮！', 'success');
       setTimeout(() => {
         tryStartNextRound(roomId, game);
@@ -396,6 +442,45 @@ io.on('connection', (socket) => {
     } else {
       broadcastGameState(roomId);
     }
+
+    // 5分钟后真正移除玩家
+    const dcTimer = setTimeout(() => {
+      disconnectTimers.delete(socket.id);
+      const currentGame = rooms.get(roomId);
+      if (!currentGame) return;
+      const currentPlayer = currentGame.players.get(socket.id);
+      if (!currentPlayer || currentPlayer.isConnected) return;
+
+      console.log(`断线超时移除: ${playerName} (${socket.id})`);
+      const wasInGame = currentGame.isGameStarted
+        && currentGame.phase !== GAME_PHASES.WAITING
+        && currentGame.phase !== GAME_PHASES.SETTLED
+        && currentGame.phase !== GAME_PHASES.SHOWDOWN;
+
+      currentGame.removePlayer(socket.id);
+      playerRooms.delete(socket.id);
+      broadcastMessage(roomId, `${playerName} 断线超时，已移出房间`);
+
+      if (currentGame.playerCount === 0) {
+        clearTurnTimer(roomId);
+        rooms.delete(roomId);
+        console.log(`房间 ${roomId} 已删除`);
+        return;
+      }
+
+      if (wasInGame && currentGame.phase === GAME_PHASES.SHOWDOWN) {
+        enterShowdown(roomId, currentGame);
+      } else if (currentGame.phase === GAME_PHASES.SHOWDOWN && currentGame.allConfirmedNext) {
+        broadcastMessage(roomId, '🚀 全员确认，开始下一轮！', 'success');
+        setTimeout(() => {
+          tryStartNextRound(roomId, currentGame);
+        }, 1000);
+      } else {
+        broadcastGameState(roomId);
+      }
+    }, DISCONNECT_TIMEOUT);
+
+    disconnectTimers.set(socket.id, { timer: dcTimer, roomId, playerName });
   });
 });
 

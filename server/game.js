@@ -118,6 +118,9 @@ class Game {
 
     // SHOWDOWN 确认续局
     this.confirmedNextPlayers = new Set();
+
+    // 是否为实际摊牌（多人对决，非全员弃牌）
+    this.isActualShowdown = false;
   }
 
   get playerCount() {
@@ -161,6 +164,53 @@ class Game {
     });
 
     return { success: true, player, seatIndex };
+  }
+
+  // 标记玩家断线（不移除）
+  markDisconnected(id) {
+    const player = this.players.get(id);
+    if (!player) return null;
+    player.isConnected = false;
+
+    // 如果在游戏中且轮到该玩家，自动弃牌
+    if (this.phase !== GAME_PHASES.WAITING && this.phase !== GAME_PHASES.SETTLED && this.phase !== GAME_PHASES.SHOWDOWN) {
+      if (this.seatOrder[this.currentPlayerIndex] === id && player.status === PLAYER_STATUS.ACTIVE) {
+        player.status = PLAYER_STATUS.FOLDED;
+        this.roundHistory.push({ type: 'action', playerId: id, playerName: player.name, action: 'fold', amount: 0 });
+        if (this.activeAndAllInPlayers.length <= 1) {
+          this.endRound();
+          return { player, roundEnded: true };
+        }
+        this.nextPlayer();
+      }
+    }
+
+    // SHOWDOWN 阶段，断线玩家自动确认
+    if (this.phase === GAME_PHASES.SHOWDOWN) {
+      this.confirmedNextPlayers.add(id);
+    }
+
+    return { player, roundEnded: false };
+  }
+
+  // 玩家重连（替换 socket ID）
+  reconnectPlayer(oldId, newId) {
+    const player = this.players.get(oldId);
+    if (!player) return null;
+
+    player.id = newId;
+    player.isConnected = true;
+    this.players.delete(oldId);
+    this.players.set(newId, player);
+    this.seatOrder = this.seatOrder.map(pid => pid === oldId ? newId : pid);
+
+    // 更新确认状态
+    if (this.confirmedNextPlayers.has(oldId)) {
+      this.confirmedNextPlayers.delete(oldId);
+      this.confirmedNextPlayers.add(newId);
+    }
+
+    return player;
   }
 
   removePlayer(id) {
@@ -297,7 +347,8 @@ class Game {
     } else {
       this.currentPlayerIndex = (bbIndex + 1) % numPlayers;
     }
-    this.lastRaiserIndex = bbIndex;
+    // 设置 lastRaiserIndex 为第一个行动者（UTG），这样 BB 有机会在行动回到 UTG 之前行动
+    this.lastRaiserIndex = this.currentPlayerIndex;
 
     this.roundHistory.push({
       type: 'blinds',
@@ -543,6 +594,9 @@ class Game {
     this.confirmedNextPlayers.clear();
     const remaining = this.activeAndAllInPlayers;
 
+    // 标记是否为实际摊牌（多人对决）
+    this.isActualShowdown = remaining.length > 1;
+
     let results;
     if (remaining.length === 1) {
       const winner = remaining[0];
@@ -729,7 +783,8 @@ class Game {
     for (const [id, player] of this.players) {
       const isShowdown = this.phase === GAME_PHASES.SHOWDOWN;
       const isSelf = id === forPlayerId;
-      const revealCards = isSelf || isShowdown;
+      // 亮牌规则：自己的牌始终可见；摊牌阶段只有实际对决（多人）时才亮牌，且已弃牌的不亮
+      const revealCards = isSelf || (isShowdown && this.isActualShowdown && player.status !== PLAYER_STATUS.FOLDED);
       const pJson = player.toJSON(revealCards);
       // 在 SHOWDOWN 时标记该玩家是否已确认下一局
       if (isShowdown) {
@@ -778,6 +833,7 @@ class Game {
         : false,
       confirmedCount: this.confirmedNextPlayers.size,
       totalPlayerCount: this.players.size,
+      isActualShowdown: this.isActualShowdown,
     };
   }
 }

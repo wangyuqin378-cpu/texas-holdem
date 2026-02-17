@@ -116,6 +116,8 @@ input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(230,162,60,.12
   content:'✓';position:absolute;top:2px;right:4px;
   font-size:10px;color:var(--success);font-weight:700;
 }
+.seat.disconnected .seat-inner{opacity:.45;border-color:#666}
+.seat.disconnected .seat-name::after{content:' ⚡';font-size:10px}
 
 /* 位置标签: D SB BB */
 .seat-role{

@@ -1,9 +1,10 @@
 /**
- * 德州扑克客户端 v4
+ * 德州扑克客户端 v5
  * - 自己永远在底部中间（视角旋转）
  * - SHOWDOWN 展示所有人牌型，全员确认后续局
  * - 聊天窗可拖拽
  * - 倒计时 / 重购 / 20轮结算
+ * - 断线自动重连
  */
 (function () {
   'use strict';
@@ -14,6 +15,7 @@
   let mySeatIndex = -1;
   let currentState = null;
   let timerInterval = null;
+  let isReconnecting = false;
 
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => document.querySelectorAll(s);
@@ -85,6 +87,14 @@
 
     generateSeats();
     initDraggableChat();
+
+    // 页面加载时自动重连
+    const savedRoom = localStorage.getItem('pokerRoom');
+    const savedName = localStorage.getItem('pokerName');
+    if (savedRoom && savedName) {
+      isReconnecting = true;
+      connectSocket();
+    }
   }
 
   // ===== 聊天窗拖拽 =====
@@ -135,8 +145,38 @@
   // ===== 连接 =====
   function connectSocket() {
     if (socket) return;
-    socket = io();
-    socket.on('connect', () => { myPlayerId = socket.id; });
+    socket = io({
+      reconnection: true,
+      reconnectionAttempts: 50,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 30000,
+    });
+
+    socket.on('connect', () => {
+      myPlayerId = socket.id;
+      // 如果之前在房间中，尝试重连
+      const savedRoom = localStorage.getItem('pokerRoom');
+      const savedName = localStorage.getItem('pokerName');
+      if (isReconnecting && savedRoom && savedName) {
+        addMessage('正在重连...', 'info');
+        socket.emit('rejoinRoom', { roomId: savedRoom, playerName: savedName }, (r) => {
+          isReconnecting = false;
+          if (r.success) {
+            myRoomId = r.roomId;
+            mySeatIndex = r.seatIndex;
+            showGame();
+            addMessage('重连成功！', 'success');
+          } else {
+            addMessage('重连失败: ' + r.message, 'error');
+            // 重连失败，清除保存的房间信息
+            localStorage.removeItem('pokerRoom');
+            showLobby();
+          }
+        });
+      }
+    });
+
     socket.on('gameState', (s) => {
       currentState = s;
       const me = s.players.find(p => p.id === myPlayerId);
@@ -145,7 +185,17 @@
     });
     socket.on('message', (m) => { addMessage(m.text, m.type); });
     socket.on('chat', (d) => { addMessage(`${d.playerName}: ${d.message}`, 'chat'); });
-    socket.on('disconnect', () => { showLobby(); });
+
+    socket.on('disconnect', () => {
+      // 不立即回大厅，标记重连中
+      const savedRoom = localStorage.getItem('pokerRoom');
+      if (savedRoom && myRoomId) {
+        isReconnecting = true;
+        addMessage('连接断开，正在尝试重连...', 'warning');
+      } else {
+        showLobby();
+      }
+    });
   }
 
   // ===== 大厅 =====
@@ -155,10 +205,10 @@
     localStorage.setItem('pokerName', n);
     return n;
   }
-  function quickJoin() { const n = getName(); if (!n) return; connectSocket(); socket.emit('quickJoin', { playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; showGame(); } else alert(r.message); }); }
-  function createRoom() { const n = getName(); if (!n) return; connectSocket(); socket.emit('createRoom', { playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; showGame(); } else alert(r.message); }); }
-  function joinRoom() { const n = getName(); if (!n) return; const rid = roomIdInput.value.trim(); if (!rid) { roomIdInput.focus(); return; } connectSocket(); socket.emit('joinRoom', { roomId: rid, playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; showGame(); } else alert(r.message); }); }
-  function leaveRoom() { if (socket) { socket.disconnect(); socket = null; } myRoomId = null; myPlayerId = null; mySeatIndex = -1; currentState = null; showLobby(); }
+  function quickJoin() { const n = getName(); if (!n) return; connectSocket(); socket.emit('quickJoin', { playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; localStorage.setItem('pokerRoom', r.roomId); showGame(); } else alert(r.message); }); }
+  function createRoom() { const n = getName(); if (!n) return; connectSocket(); socket.emit('createRoom', { playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; localStorage.setItem('pokerRoom', r.roomId); showGame(); } else alert(r.message); }); }
+  function joinRoom() { const n = getName(); if (!n) return; const rid = roomIdInput.value.trim(); if (!rid) { roomIdInput.focus(); return; } connectSocket(); socket.emit('joinRoom', { roomId: rid, playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; localStorage.setItem('pokerRoom', r.roomId); showGame(); } else alert(r.message); }); }
+  function leaveRoom() { localStorage.removeItem('pokerRoom'); isReconnecting = false; if (socket) { socket.disconnect(); socket = null; } myRoomId = null; myPlayerId = null; mySeatIndex = -1; currentState = null; showLobby(); }
   function copyRoomId() { if (!myRoomId) return; navigator.clipboard.writeText(myRoomId).then(() => { const b = $('#btnCopyRoom'); b.textContent = '✓'; setTimeout(() => { b.textContent = '📋'; }, 1200); }); }
   function showLobby() { lobby.classList.add('active'); gameScreen.classList.remove('active'); messagesEl.innerHTML = ''; stopTimer(); }
   function showGame() { lobby.classList.remove('active'); gameScreen.classList.add('active'); roomIdDisplay.textContent = myRoomId; }
@@ -279,6 +329,11 @@
 
       el.querySelector('.seat-name').textContent = p.name;
       el.querySelector('.seat-chips').textContent = `💰${p.chips}`;
+
+      // 断线状态
+      if (!p.isConnected) {
+        el.classList.add('disconnected');
+      }
 
       // 位置标签 D / SB / BB
       const roleEl = el.querySelector('.seat-role');
