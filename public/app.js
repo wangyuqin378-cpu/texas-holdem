@@ -1,7 +1,7 @@
 /**
- * 德州扑克客户端 v3
+ * 德州扑克客户端 v4
  * - 自己永远在底部中间（视角旋转）
- * - 每局快速结算，自动续局，无弹窗阻断
+ * - SHOWDOWN 展示所有人牌型，全员确认后续局
  * - 聊天窗可拖拽
  * - 倒计时 / 重购 / 20轮结算
  */
@@ -30,6 +30,7 @@
   const potDisplay = $('#potDisplay');
   const actionBar = $('#actionBar');
   const readyBar = $('#readyBar');
+  const showdownBar = $('#showdownBar');
   const raiseControls = $('#raiseControls');
   const raiseSlider = $('#raiseSlider');
   const raiseAmountInput = $('#raiseAmount');
@@ -61,6 +62,8 @@
     $('#btnConfirmRaise').addEventListener('click', confirmRaise);
     $('#btnSendChat').addEventListener('click', sendChat);
     $('#btnRebuy').addEventListener('click', doRebuy);
+    $('#btnRebuyShowdown').addEventListener('click', doRebuy);
+    $('#btnConfirmNext').addEventListener('click', doConfirmNext);
     $('#btnRestart').addEventListener('click', doRestart);
 
     chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
@@ -90,7 +93,6 @@
     let startX, startY, origX, origY;
 
     function onStart(e) {
-      // 不在输入框和按钮上拖拽
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
       dragging = true;
       const touch = e.touches ? e.touches[0] : e;
@@ -137,7 +139,6 @@
     socket.on('connect', () => { myPlayerId = socket.id; });
     socket.on('gameState', (s) => {
       currentState = s;
-      // 记住自己的座位
       const me = s.players.find(p => p.id === myPlayerId);
       if (me) mySeatIndex = me.seatIndex;
       renderGameState(s);
@@ -176,6 +177,23 @@
   }
   function confirmRaise() { const a = parseInt(raiseAmountInput.value, 10); if (isNaN(a) || a <= 0) return; socket.emit('action', { action: 'raise', amount: a }, (r) => { if (!r.success && r.message) addMessage(r.message, 'error'); }); raiseControls.classList.add('hidden'); }
   function doRebuy() { if (socket) socket.emit('rebuy', (r) => { if (!r.success) addMessage(r.message || '重购失败', 'error'); }); }
+  function doConfirmNext() {
+    if (!socket) return;
+    const btn = $('#btnConfirmNext');
+    btn.disabled = true;
+    btn.textContent = '⏳ 已确认，等待其他人...';
+    btn.classList.remove('btn-primary');
+    btn.classList.add('btn-secondary');
+    socket.emit('confirmNext', (r) => {
+      if (!r.success) {
+        addMessage(r.message || '确认失败', 'error');
+        btn.disabled = false;
+        btn.textContent = '✅ 确认下一局';
+        btn.classList.add('btn-primary');
+        btn.classList.remove('btn-secondary');
+      }
+    });
+  }
   function doRestart() { if (socket) socket.emit('restart', () => {}); settlementOverlay.classList.add('hidden'); }
   function sendChat() { const m = chatInput.value.trim(); if (!m || !socket) return; socket.emit('chat', { message: m }); chatInput.value = ''; }
 
@@ -195,10 +213,8 @@
   }
 
   // ===== 视角旋转 =====
-  // 将服务器 seatIndex 映射到视觉位置（自己永远在 0 = 底部中间）
   function toVisualSeat(serverSeatIndex) {
     if (mySeatIndex < 0) return serverSeatIndex;
-    // 共7个位置，自己占位置0
     return (serverSeatIndex - mySeatIndex + 7) % 7;
   }
 
@@ -277,6 +293,24 @@
       if (st.phase === 'waiting') {
         statusEl.textContent = p.isReady ? '已准备' : '未准备';
         if (p.isReady) statusEl.classList.add('ready');
+      } else if (st.phase === 'showdown' && st.lastResults) {
+        // SHOWDOWN：显示牌型、赢家、确认状态
+        const pResult = st.lastResults.find(r => r.playerId === p.id);
+        if (pResult) {
+          if (pResult.winAmount > 0) {
+            statusEl.textContent = `🏆 +${pResult.winAmount} ${pResult.handName || ''}`;
+            statusEl.classList.add('winner');
+            el.classList.add('winner');
+          } else if (p.status === 'folded') {
+            statusEl.textContent = '弃牌';
+          } else {
+            statusEl.textContent = pResult.handName || '';
+          }
+        }
+        // 已确认的玩家打勾
+        if (p.confirmedNext) {
+          el.classList.add('confirmed');
+        }
       } else if (st.phase !== 'settled') {
         if (p.status === 'folded') statusEl.textContent = '弃牌';
         else if (p.status === 'all_in') statusEl.textContent = '全下';
@@ -317,6 +351,7 @@
     if (isMyTurn && st.availableActions.length > 0) {
       actionBar.classList.remove('hidden');
       readyBar.classList.add('hidden');
+      showdownBar.classList.add('hidden');
       $('#btnFold').classList.toggle('hidden', !st.availableActions.includes('fold'));
       $('#btnCheck').classList.toggle('hidden', !st.availableActions.includes('check'));
       $('#btnCall').classList.toggle('hidden', !st.availableActions.includes('call'));
@@ -330,7 +365,39 @@
       if (!isMyTurn) stopTimer();
     }
 
-    // 准备栏（只在等待阶段 & 未开始时显示）
+    // SHOWDOWN 阶段 → 显示确认栏
+    if (st.phase === 'showdown') {
+      readyBar.classList.add('hidden');
+      showdownBar.classList.remove('hidden');
+
+      // 确认状态
+      const confirmStatusEl = $('#confirmStatus');
+      confirmStatusEl.textContent = `已确认: ${st.confirmedCount}/${st.totalPlayerCount}`;
+
+      // 自己是否已确认
+      const me = st.players.find(p => p.id === myPlayerId);
+      const myConfirmed = me && me.confirmedNext;
+      const btnConfirm = $('#btnConfirmNext');
+      if (myConfirmed) {
+        btnConfirm.disabled = true;
+        btnConfirm.textContent = '⏳ 已确认，等待其他人...';
+        btnConfirm.classList.remove('btn-primary');
+        btnConfirm.classList.add('btn-secondary');
+      } else {
+        btnConfirm.disabled = false;
+        btnConfirm.textContent = '✅ 确认下一局';
+        btnConfirm.classList.add('btn-primary');
+        btnConfirm.classList.remove('btn-secondary');
+      }
+
+      // 重购按钮
+      const btnRebuySD = $('#btnRebuyShowdown');
+      btnRebuySD.classList.toggle('hidden', !st.canRebuy);
+    } else {
+      showdownBar.classList.add('hidden');
+    }
+
+    // 准备栏（只在等待阶段显示）
     if (st.phase === 'waiting') {
       readyBar.classList.remove('hidden');
       const me = st.players.find(p => p.id === myPlayerId);
@@ -347,8 +414,7 @@
       readyBar.classList.add('hidden');
     }
 
-    // showdown 阶段不弹窗，结果走消息流，2.5秒后自动续局
-    // 只在20轮结算时弹窗
+    // 20轮结算弹窗
     if (st.phase === 'settled' && st.settlement) {
       showSettlement(st.settlement);
     } else {

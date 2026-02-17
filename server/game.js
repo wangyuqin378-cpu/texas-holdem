@@ -4,6 +4,7 @@
  * - 重购积分
  * - 2分钟倒计时
  * - 庄家/大盲/小盲位置标记
+ * - SHOWDOWN 阶段需全员确认才续局
  */
 
 const { Deck } = require('./deck');
@@ -38,8 +39,8 @@ class Player {
     this.name = name;
     this.seatIndex = seatIndex;
     this.chips = INITIAL_CHIPS;
-    this.initialChips = INITIAL_CHIPS; // 本局开始时的筹码（用于结算）
-    this.totalBuyIn = INITIAL_CHIPS; // 总买入
+    this.initialChips = INITIAL_CHIPS;
+    this.totalBuyIn = INITIAL_CHIPS;
     this.holeCards = [];
     this.currentBet = 0;
     this.totalBetThisRound = 0;
@@ -105,7 +106,7 @@ class Game {
     // 20轮制
     this.currentRound = 0;
     this.maxRounds = MAX_ROUNDS;
-    this.isGameStarted = false; // 整场比赛是否已开始
+    this.isGameStarted = false;
 
     // 倒计时
     this.turnStartTime = null;
@@ -114,6 +115,9 @@ class Game {
     // 位置标记
     this.sbSeatIndex = -1;
     this.bbSeatIndex = -1;
+
+    // SHOWDOWN 确认续局
+    this.confirmedNextPlayers = new Set();
   }
 
   get playerCount() {
@@ -165,9 +169,13 @@ class Game {
 
     this.players.delete(id);
     this.seatOrder = this.seatOrder.filter(pid => pid !== id);
+    this.confirmedNextPlayers.delete(id);
 
     if (this.phase !== GAME_PHASES.WAITING && this.phase !== GAME_PHASES.SETTLED) {
-      if (this.activeAndAllInPlayers.length <= 1) {
+      if (this.phase === GAME_PHASES.SHOWDOWN) {
+        // SHOWDOWN 阶段，玩家离开不需要 endRound，只需更新确认状态
+        // 外部会检查 allConfirmed
+      } else if (this.activeAndAllInPlayers.length <= 1) {
         this.endRound();
       } else if (this.currentPlayerIndex >= this.seatOrder.length) {
         this.currentPlayerIndex = 0;
@@ -201,6 +209,7 @@ class Game {
     this.currentBet = 0;
     this.roundHistory = [];
     this.lastResults = null;
+    this.confirmedNextPlayers.clear();
 
     // 有筹码的玩家参与
     this.seatOrder = [...this.players.values()]
@@ -304,14 +313,12 @@ class Game {
     return this.players.get(this.seatOrder[this.currentPlayerIndex]);
   }
 
-  // 获取当前玩家剩余秒数
   getTurnTimeRemaining() {
     if (!this.turnStartTime) return this.turnTimeLimit;
     const elapsed = Math.floor((Date.now() - this.turnStartTime) / 1000);
     return Math.max(0, this.turnTimeLimit - elapsed);
   }
 
-  // 超时自动弃牌
   handleTimeout() {
     const player = this.getCurrentPlayer();
     if (!player) return null;
@@ -369,8 +376,6 @@ class Game {
 
       if (this.isBettingRoundComplete()) {
         this.advancePhase();
-        // 如果 advancePhase 最终到了 SHOWDOWN（正常比牌结束），
-        // 必须返回 roundEnded 让服务器触发自动续局
         if (this.phase === GAME_PHASES.SHOWDOWN) {
           return { ...result, roundEnded: true };
         }
@@ -378,7 +383,7 @@ class Game {
       }
 
       this.nextPlayer();
-      this.turnStartTime = Date.now(); // 重置倒计时
+      this.turnStartTime = Date.now();
     }
 
     return result;
@@ -535,6 +540,7 @@ class Game {
   endRound() {
     this.phase = GAME_PHASES.SHOWDOWN;
     this.turnStartTime = null;
+    this.confirmedNextPlayers.clear();
     const remaining = this.activeAndAllInPlayers;
 
     let results;
@@ -600,7 +606,27 @@ class Game {
     return results;
   }
 
-  // 准备下一轮（不需要手动准备）
+  // 玩家确认下一局
+  playerConfirmNext(playerId) {
+    if (this.phase !== GAME_PHASES.SHOWDOWN) {
+      return { success: false, message: '当前不在结算阶段' };
+    }
+    if (!this.players.has(playerId)) {
+      return { success: false, message: '玩家不存在' };
+    }
+    this.confirmedNextPlayers.add(playerId);
+    return { success: true };
+  }
+
+  // 是否所有人都确认了
+  get allConfirmedNext() {
+    if (this.phase !== GAME_PHASES.SHOWDOWN) return false;
+    for (const [id] of this.players) {
+      if (!this.confirmedNextPlayers.has(id)) return false;
+    }
+    return this.players.size >= 1;
+  }
+
   prepareNextRound() {
     if (this.currentRound >= this.maxRounds) {
       this.phase = GAME_PHASES.SETTLED;
@@ -615,10 +641,11 @@ class Game {
     this.lastResults = null;
     this.sbSeatIndex = -1;
     this.bbSeatIndex = -1;
+    this.confirmedNextPlayers.clear();
 
     for (const [, player] of this.players) {
       player.reset();
-      player.isReady = true; // 自动准备
+      player.isReady = true;
     }
 
     return true;
@@ -660,6 +687,7 @@ class Game {
     this.lastResults = null;
     this.sbSeatIndex = -1;
     this.bbSeatIndex = -1;
+    this.confirmedNextPlayers.clear();
 
     for (const [, player] of this.players) {
       player.chips = INITIAL_CHIPS;
@@ -702,7 +730,12 @@ class Game {
       const isShowdown = this.phase === GAME_PHASES.SHOWDOWN;
       const isSelf = id === forPlayerId;
       const revealCards = isSelf || isShowdown;
-      players.push(player.toJSON(revealCards));
+      const pJson = player.toJSON(revealCards);
+      // 在 SHOWDOWN 时标记该玩家是否已确认下一局
+      if (isShowdown) {
+        pJson.confirmedNext = this.confirmedNextPlayers.has(id);
+      }
+      players.push(pJson);
     }
 
     const currentPlayer = this.getCurrentPlayer();
@@ -739,7 +772,12 @@ class Game {
       turnTimeRemaining: this.getTurnTimeRemaining(),
       turnTimeLimit: this.turnTimeLimit,
       settlement: this.phase === GAME_PHASES.SETTLED ? this.getSettlement() : null,
-      canRebuy: forPlayerId ? (this.players.get(forPlayerId)?.chips === 0 && this.phase === GAME_PHASES.WAITING) : false,
+      canRebuy: forPlayerId
+        ? (this.players.get(forPlayerId)?.chips === 0
+          && (this.phase === GAME_PHASES.WAITING || this.phase === GAME_PHASES.SHOWDOWN || this.phase === GAME_PHASES.SETTLED))
+        : false,
+      confirmedCount: this.confirmedNextPlayers.size,
+      totalPlayerCount: this.players.size,
     };
   }
 }
