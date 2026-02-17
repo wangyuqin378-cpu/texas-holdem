@@ -1,11 +1,19 @@
 /**
  * 德州扑克游戏核心逻辑
+ * - 20轮制
+ * - 重购积分
+ * - 2分钟倒计时
+ * - 庄家/大盲/小盲位置标记
  */
 
 const { Deck } = require('./deck');
 const { evaluateBestHand, determineWinners } = require('./handEvaluator');
 
 const MAX_PLAYERS = 7;
+const MAX_ROUNDS = 20;
+const INITIAL_CHIPS = 1000;
+const REBUY_AMOUNT = 1000;
+const ACTION_TIMEOUT = 120; // 2分钟（秒）
 
 const GAME_PHASES = {
   WAITING: 'waiting',
@@ -14,6 +22,7 @@ const GAME_PHASES = {
   TURN: 'turn',
   RIVER: 'river',
   SHOWDOWN: 'showdown',
+  SETTLED: 'settled',
 };
 
 const PLAYER_STATUS = {
@@ -28,7 +37,9 @@ class Player {
     this.id = id;
     this.name = name;
     this.seatIndex = seatIndex;
-    this.chips = 1000; // 初始筹码
+    this.chips = INITIAL_CHIPS;
+    this.initialChips = INITIAL_CHIPS; // 本局开始时的筹码（用于结算）
+    this.totalBuyIn = INITIAL_CHIPS; // 总买入
     this.holeCards = [];
     this.currentBet = 0;
     this.totalBetThisRound = 0;
@@ -48,6 +59,14 @@ class Player {
     }
   }
 
+  rebuy() {
+    if (this.chips > 0) return { success: false, message: '还有筹码，无需重购' };
+    this.chips = REBUY_AMOUNT;
+    this.totalBuyIn += REBUY_AMOUNT;
+    this.status = PLAYER_STATUS.ACTIVE;
+    return { success: true, amount: REBUY_AMOUNT };
+  }
+
   toJSON(revealCards = false) {
     return {
       id: this.id,
@@ -59,6 +78,7 @@ class Player {
       status: this.status,
       isReady: this.isReady,
       isConnected: this.isConnected,
+      totalBuyIn: this.totalBuyIn,
     };
   }
 }
@@ -67,21 +87,33 @@ class Game {
   constructor(roomId) {
     this.roomId = roomId;
     this.players = new Map();
-    this.seatOrder = []; // 按座位顺序排列的玩家ID
+    this.seatOrder = [];
     this.deck = new Deck();
     this.communityCards = [];
     this.pot = 0;
     this.sidePots = [];
     this.phase = GAME_PHASES.WAITING;
-    this.dealerIndex = 0; // 庄家在 seatOrder 中的索引
+    this.dealerIndex = -1;
     this.currentPlayerIndex = -1;
     this.smallBlind = 10;
     this.bigBlind = 20;
-    this.currentBet = 0; // 本轮最大下注
+    this.currentBet = 0;
     this.minRaise = 0;
     this.lastRaiserIndex = -1;
-    this.actionTimer = null;
     this.roundHistory = [];
+
+    // 20轮制
+    this.currentRound = 0;
+    this.maxRounds = MAX_ROUNDS;
+    this.isGameStarted = false; // 整场比赛是否已开始
+
+    // 倒计时
+    this.turnStartTime = null;
+    this.turnTimeLimit = ACTION_TIMEOUT;
+
+    // 位置标记
+    this.sbSeatIndex = -1;
+    this.bbSeatIndex = -1;
   }
 
   get playerCount() {
@@ -108,7 +140,6 @@ class Game {
       return { success: false, message: '已在房间中' };
     }
 
-    // 找到空座位
     const takenSeats = new Set([...this.players.values()].map(p => p.seatIndex));
     let seatIndex = -1;
     for (let i = 0; i < MAX_PLAYERS; i++) {
@@ -121,11 +152,8 @@ class Game {
     const player = new Player(id, name, seatIndex);
     this.players.set(id, player);
     this.seatOrder.push(id);
-    // 按座位排序
     this.seatOrder.sort((a, b) => {
-      const pa = this.players.get(a);
-      const pb = this.players.get(b);
-      return pa.seatIndex - pb.seatIndex;
+      return this.players.get(a).seatIndex - this.players.get(b).seatIndex;
     });
 
     return { success: true, player, seatIndex };
@@ -138,11 +166,12 @@ class Game {
     this.players.delete(id);
     this.seatOrder = this.seatOrder.filter(pid => pid !== id);
 
-    // 如果游戏进行中，标记为弃牌
-    if (this.phase !== GAME_PHASES.WAITING) {
-      // 检查是否需要结束游戏
+    if (this.phase !== GAME_PHASES.WAITING && this.phase !== GAME_PHASES.SETTLED) {
       if (this.activeAndAllInPlayers.length <= 1) {
         this.endRound();
+      } else if (this.currentPlayerIndex >= this.seatOrder.length) {
+        this.currentPlayerIndex = 0;
+        this.nextPlayer();
       } else if (this.seatOrder[this.currentPlayerIndex] === id) {
         this.nextPlayer();
       }
@@ -159,30 +188,28 @@ class Game {
   }
 
   canStartGame() {
-    const readyPlayers = [...this.players.values()].filter(
-      p => p.isReady && p.chips > 0
-    );
+    const readyPlayers = [...this.players.values()].filter(p => p.isReady && p.chips > 0);
     return readyPlayers.length >= 2 && this.phase === GAME_PHASES.WAITING;
   }
 
-  startGame() {
-    if (!this.canStartGame()) return false;
-
-    // 重置牌组
+  // 开始一轮
+  startRound() {
     this.deck.reset();
     this.communityCards = [];
     this.pot = 0;
     this.sidePots = [];
     this.currentBet = 0;
     this.roundHistory = [];
+    this.lastResults = null;
 
-    // 只让准备好且有筹码的玩家参与
+    // 有筹码的玩家参与
     this.seatOrder = [...this.players.values()]
-      .filter(p => p.isReady && p.chips > 0)
+      .filter(p => p.chips > 0)
       .sort((a, b) => a.seatIndex - b.seatIndex)
       .map(p => p.id);
 
-    // 重置每个玩家
+    if (this.seatOrder.length < 2) return false;
+
     for (const id of this.seatOrder) {
       this.players.get(id).reset();
     }
@@ -198,21 +225,34 @@ class Game {
       }
     }
 
-    // 强制下盲注
     this.postBlinds();
-
-    // 设置阶段
     this.phase = GAME_PHASES.PRE_FLOP;
+    this.currentRound++;
+    this.turnStartTime = Date.now();
 
     return true;
   }
 
+  // 首次开始整场比赛
+  startGame() {
+    if (!this.canStartGame()) return false;
+    this.isGameStarted = true;
+    this.currentRound = 0;
+    this.dealerIndex = -1;
+
+    // 重置所有玩家的买入记录
+    for (const [, player] of this.players) {
+      player.totalBuyIn = player.chips;
+    }
+
+    return this.startRound();
+  }
+
   postBlinds() {
     const numPlayers = this.seatOrder.length;
-
     let sbIndex, bbIndex;
+
     if (numPlayers === 2) {
-      // 两人时庄家是小盲
       sbIndex = this.dealerIndex;
       bbIndex = (this.dealerIndex + 1) % numPlayers;
     } else {
@@ -223,7 +263,9 @@ class Game {
     const sbPlayer = this.players.get(this.seatOrder[sbIndex]);
     const bbPlayer = this.players.get(this.seatOrder[bbIndex]);
 
-    // 下小盲
+    this.sbSeatIndex = sbPlayer.seatIndex;
+    this.bbSeatIndex = bbPlayer.seatIndex;
+
     const sbAmount = Math.min(this.smallBlind, sbPlayer.chips);
     sbPlayer.chips -= sbAmount;
     sbPlayer.currentBet = sbAmount;
@@ -231,7 +273,6 @@ class Game {
     this.pot += sbAmount;
     if (sbPlayer.chips === 0) sbPlayer.status = PLAYER_STATUS.ALL_IN;
 
-    // 下大盲
     const bbAmount = Math.min(this.bigBlind, bbPlayer.chips);
     bbPlayer.chips -= bbAmount;
     bbPlayer.currentBet = bbAmount;
@@ -242,7 +283,6 @@ class Game {
     this.currentBet = this.bigBlind;
     this.minRaise = this.bigBlind;
 
-    // 翻牌前，大盲后面的人先行动
     if (numPlayers === 2) {
       this.currentPlayerIndex = sbIndex;
     } else {
@@ -264,9 +304,20 @@ class Game {
     return this.players.get(this.seatOrder[this.currentPlayerIndex]);
   }
 
-  /**
-   * 玩家行动
-   */
+  // 获取当前玩家剩余秒数
+  getTurnTimeRemaining() {
+    if (!this.turnStartTime) return this.turnTimeLimit;
+    const elapsed = Math.floor((Date.now() - this.turnStartTime) / 1000);
+    return Math.max(0, this.turnTimeLimit - elapsed);
+  }
+
+  // 超时自动弃牌
+  handleTimeout() {
+    const player = this.getCurrentPlayer();
+    if (!player) return null;
+    return this.playerAction(player.id, 'fold');
+  }
+
   playerAction(playerId, action, amount = 0) {
     const player = this.players.get(playerId);
     if (!player) return { success: false, message: '玩家不存在' };
@@ -311,19 +362,18 @@ class Game {
         amount: result.amount || 0,
       });
 
-      // 检查是否只剩一个活跃玩家
       if (this.activeAndAllInPlayers.length <= 1) {
         this.endRound();
         return { ...result, roundEnded: true };
       }
 
-      // 检查是否本轮下注结束
       if (this.isBettingRoundComplete()) {
         this.advancePhase();
         return { ...result, phaseChanged: true, newPhase: this.phase };
       }
 
       this.nextPlayer();
+      this.turnStartTime = Date.now(); // 重置倒计时
     }
 
     return result;
@@ -347,11 +397,7 @@ class Game {
     player.currentBet += callAmount;
     player.totalBetThisRound += callAmount;
     this.pot += callAmount;
-
-    if (player.chips === 0) {
-      player.status = PLAYER_STATUS.ALL_IN;
-    }
-
+    if (player.chips === 0) player.status = PLAYER_STATUS.ALL_IN;
     return { success: true, action: 'call', amount: callAmount };
   }
 
@@ -362,24 +408,18 @@ class Game {
     if (amount < this.minRaise && player.chips > totalAmount) {
       return { success: false, message: `加注至少 ${this.minRaise}` };
     }
-
     if (totalAmount > player.chips) {
       return { success: false, message: '筹码不足' };
     }
 
-    const raiseBy = amount;
     player.chips -= totalAmount;
     player.currentBet += totalAmount;
     player.totalBetThisRound += totalAmount;
     this.pot += totalAmount;
     this.currentBet = player.currentBet;
-    this.minRaise = Math.max(this.minRaise, raiseBy);
+    this.minRaise = Math.max(this.minRaise, amount);
     this.lastRaiserIndex = this.currentPlayerIndex;
-
-    if (player.chips === 0) {
-      player.status = PLAYER_STATUS.ALL_IN;
-    }
-
+    if (player.chips === 0) player.status = PLAYER_STATUS.ALL_IN;
     return { success: true, action: 'raise', amount: totalAmount };
   }
 
@@ -397,7 +437,6 @@ class Game {
       this.currentBet = player.currentBet;
       this.lastRaiserIndex = this.currentPlayerIndex;
     }
-
     return { success: true, action: 'allin', amount: allInAmount };
   }
 
@@ -405,7 +444,6 @@ class Game {
     const numPlayers = this.seatOrder.length;
     let nextIndex = (this.currentPlayerIndex + 1) % numPlayers;
     let checked = 0;
-
     while (checked < numPlayers) {
       const player = this.players.get(this.seatOrder[nextIndex]);
       if (player && player.status === PLAYER_STATUS.ACTIVE) {
@@ -419,17 +457,9 @@ class Game {
 
   isBettingRoundComplete() {
     const activePlayers = this.activePlayers;
-
-    // 如果没有活跃玩家（都 all-in 或弃牌），下注轮结束
     if (activePlayers.length === 0) return true;
-
-    // 所有活跃玩家下注相同且都已行动
     const allBetsEqual = activePlayers.every(p => p.currentBet === this.currentBet);
-
     if (!allBetsEqual) return false;
-
-    // 确保每个人至少行动过一次
-    // 通过检查 nextPlayer 是否是 lastRaiser 来判断
     const nextIndex = this.findNextActivePlayerIndex(this.currentPlayerIndex);
     return nextIndex === this.lastRaiserIndex || nextIndex === -1;
   }
@@ -438,7 +468,6 @@ class Game {
     const numPlayers = this.seatOrder.length;
     let nextIndex = (fromIndex + 1) % numPlayers;
     let checked = 0;
-
     while (checked < numPlayers) {
       const player = this.players.get(this.seatOrder[nextIndex]);
       if (player && player.status === PLAYER_STATUS.ACTIVE) {
@@ -451,7 +480,6 @@ class Game {
   }
 
   advancePhase() {
-    // 重置每轮下注
     for (const id of this.seatOrder) {
       const player = this.players.get(id);
       if (player) player.currentBet = 0;
@@ -478,7 +506,6 @@ class Game {
         return;
     }
 
-    // 找到庄家后第一个活跃玩家
     const numPlayers = this.seatOrder.length;
     let startIdx = (this.dealerIndex + 1) % numPlayers;
     let found = false;
@@ -493,20 +520,20 @@ class Game {
       }
     }
 
-    // 如果没有活跃玩家可以行动（都 all-in），直接发剩余公共牌
     if (!found) {
       this.advancePhase();
+    } else {
+      this.turnStartTime = Date.now();
     }
   }
 
   endRound() {
     this.phase = GAME_PHASES.SHOWDOWN;
+    this.turnStartTime = null;
     const remaining = this.activeAndAllInPlayers;
 
     let results;
-
     if (remaining.length === 1) {
-      // 只剩一人，直接获胜
       const winner = remaining[0];
       winner.chips += this.pot;
       results = [{
@@ -517,14 +544,10 @@ class Game {
         handName: '其他玩家弃牌',
       }];
     } else {
-      // 比牌
-      // 处理边池
       results = this.calculateWinnings(remaining);
     }
 
     this.roundHistory.push({ type: 'showdown', results });
-
-    // 延迟重置，让前端展示结果
     this.lastResults = results;
     this.lastCommunityCards = [...this.communityCards];
 
@@ -532,21 +555,13 @@ class Game {
   }
 
   calculateWinnings(contenders) {
-    // 简化边池处理：按 totalBetThisRound 排序创建边池
-    const sortedByBet = [...contenders].sort((a, b) => a.totalBetThisRound - b.totalBetThisRound);
     const results = [];
-    const winMap = new Map(); // playerId -> winAmount
-
-    let remainingPot = this.pot;
-
-    // 评估每位玩家的手牌
     const evaluatedPlayers = contenders.map(p => {
       const allCards = [...p.holeCards, ...this.communityCards];
       const hand = evaluateBestHand(allCards);
       return { ...p, hand, allCards };
     });
 
-    // 简化处理：直接比较手牌，赢家平分底池
     const winners = determineWinners(
       evaluatedPlayers.map(p => ({
         id: p.id,
@@ -563,11 +578,9 @@ class Game {
       let amount = 0;
       if (winnerIds.has(ep.id)) {
         amount = winAmount;
-        // 余数给第一个赢家
         if (ep.id === winners[0].id) amount += remainder;
         player.chips += amount;
       }
-      winMap.set(ep.id, amount);
 
       results.push({
         playerId: ep.id,
@@ -582,33 +595,78 @@ class Game {
     return results;
   }
 
-  resetForNewRound() {
-    this.phase = GAME_PHASES.WAITING;
+  // 准备下一轮（不需要手动准备）
+  prepareNextRound() {
+    if (this.currentRound >= this.maxRounds) {
+      this.phase = GAME_PHASES.SETTLED;
+      return false;
+    }
+
     this.communityCards = [];
     this.pot = 0;
     this.sidePots = [];
     this.currentBet = 0;
     this.currentPlayerIndex = -1;
     this.lastResults = null;
+    this.sbSeatIndex = -1;
+    this.bbSeatIndex = -1;
 
-    // 重置所有玩家
     for (const [, player] of this.players) {
       player.reset();
-      player.isReady = false;
+      player.isReady = true; // 自动准备
     }
 
-    // 移除筹码为0的玩家标记
+    return true;
+  }
+
+  // 重购积分
+  playerRebuy(playerId) {
+    const player = this.players.get(playerId);
+    if (!player) return { success: false, message: '玩家不存在' };
+    return player.rebuy();
+  }
+
+  // 获取结算数据
+  getSettlement() {
+    const settlement = [];
     for (const [, player] of this.players) {
-      if (player.chips <= 0) {
-        player.chips = 1000; // 补充筹码
-        player.status = PLAYER_STATUS.ACTIVE;
-      }
+      const profit = player.chips - player.totalBuyIn;
+      settlement.push({
+        id: player.id,
+        name: player.name,
+        seatIndex: player.seatIndex,
+        finalChips: player.chips,
+        totalBuyIn: player.totalBuyIn,
+        profit,
+      });
+    }
+    settlement.sort((a, b) => b.profit - a.profit);
+    return settlement;
+  }
+
+  // 重新开始整场比赛
+  restartGame() {
+    this.currentRound = 0;
+    this.dealerIndex = -1;
+    this.isGameStarted = false;
+    this.phase = GAME_PHASES.WAITING;
+    this.communityCards = [];
+    this.pot = 0;
+    this.lastResults = null;
+    this.sbSeatIndex = -1;
+    this.bbSeatIndex = -1;
+
+    for (const [, player] of this.players) {
+      player.chips = INITIAL_CHIPS;
+      player.totalBuyIn = INITIAL_CHIPS;
+      player.holeCards = [];
+      player.currentBet = 0;
+      player.totalBetThisRound = 0;
+      player.status = PLAYER_STATUS.ACTIVE;
+      player.isReady = false;
     }
   }
 
-  /**
-   * 获取玩家可执行的操作
-   */
   getAvailableActions(playerId) {
     const player = this.players.get(playerId);
     if (!player || player.status !== PLAYER_STATUS.ACTIVE) return [];
@@ -630,16 +688,11 @@ class Game {
     }
 
     actions.push('allin');
-
     return actions;
   }
 
-  /**
-   * 获取游戏状态（对特定玩家）
-   */
   getState(forPlayerId = null) {
     const players = [];
-
     for (const [id, player] of this.players) {
       const isShowdown = this.phase === GAME_PHASES.SHOWDOWN;
       const isSelf = id === forPlayerId;
@@ -648,6 +701,9 @@ class Game {
     }
 
     const currentPlayer = this.getCurrentPlayer();
+    const dealerPlayer = this.seatOrder.length > 0
+      ? this.players.get(this.seatOrder[this.dealerIndex])
+      : null;
 
     return {
       roomId: this.roomId,
@@ -657,9 +713,9 @@ class Game {
       pot: this.pot,
       currentBet: this.currentBet,
       dealerIndex: this.dealerIndex,
-      dealerSeat: this.seatOrder.length > 0
-        ? this.players.get(this.seatOrder[this.dealerIndex])?.seatIndex
-        : -1,
+      dealerSeat: dealerPlayer?.seatIndex ?? -1,
+      sbSeat: this.sbSeatIndex,
+      bbSeat: this.bbSeatIndex,
       currentPlayerId: currentPlayer?.id || null,
       currentPlayerSeat: currentPlayer?.seatIndex ?? -1,
       smallBlind: this.smallBlind,
@@ -672,6 +728,13 @@ class Game {
       lastResults: this.lastResults || null,
       playerCount: this.players.size,
       maxPlayers: MAX_PLAYERS,
+      currentRound: this.currentRound,
+      maxRounds: this.maxRounds,
+      isGameStarted: this.isGameStarted,
+      turnTimeRemaining: this.getTurnTimeRemaining(),
+      turnTimeLimit: this.turnTimeLimit,
+      settlement: this.phase === GAME_PHASES.SETTLED ? this.getSettlement() : null,
+      canRebuy: forPlayerId ? (this.players.get(forPlayerId)?.chips === 0 && this.phase === GAME_PHASES.WAITING) : false,
     };
   }
 }

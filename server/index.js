@@ -1,5 +1,8 @@
 /**
  * 德州扑克在线服务器
+ * - 20轮制 + 自动续局
+ * - 重购 + 结算
+ * - 2分钟倒计时
  */
 
 const express = require('express');
@@ -15,13 +18,11 @@ const io = new Server(server, {
   cors: { origin: '*' },
 });
 
-// 静态文件
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// 房间管理
 const rooms = new Map();
-// 玩家 -> 房间映射
 const playerRooms = new Map();
+const roomTimers = new Map(); // roomId -> timer interval
 
 function createRoom() {
   const roomId = uuidv4().substring(0, 6).toUpperCase();
@@ -33,9 +34,7 @@ function createRoom() {
 function broadcastGameState(roomId) {
   const game = rooms.get(roomId);
   if (!game) return;
-
-  // 给每个玩家发送他们各自视角的状态
-  for (const [playerId, player] of game.players) {
+  for (const [playerId] of game.players) {
     const state = game.getState(playerId);
     io.to(playerId).emit('gameState', state);
   }
@@ -45,18 +44,115 @@ function broadcastMessage(roomId, message, type = 'info') {
   io.to(roomId).emit('message', { text: message, type, timestamp: Date.now() });
 }
 
+// 启动倒计时检测
+function startTurnTimer(roomId) {
+  clearTurnTimer(roomId);
+  const timer = setInterval(() => {
+    const game = rooms.get(roomId);
+    if (!game) { clearTurnTimer(roomId); return; }
+    if (game.phase === GAME_PHASES.WAITING || game.phase === GAME_PHASES.SHOWDOWN || game.phase === GAME_PHASES.SETTLED) {
+      return;
+    }
+
+    const remaining = game.getTurnTimeRemaining();
+    // 每10秒广播一次状态（同步倒计时）
+    if (remaining % 10 === 0 || remaining <= 10) {
+      broadcastGameState(roomId);
+    }
+    // 超时
+    if (remaining <= 0) {
+      const player = game.getCurrentPlayer();
+      if (player) {
+        broadcastMessage(roomId, `⏰ ${player.name} 操作超时，自动弃牌`);
+        const result = game.handleTimeout();
+        if (result && result.success) {
+          handleActionResult(roomId, game, result, player, 'fold');
+        }
+      }
+    }
+  }, 1000);
+  roomTimers.set(roomId, timer);
+}
+
+function clearTurnTimer(roomId) {
+  const timer = roomTimers.get(roomId);
+  if (timer) {
+    clearInterval(timer);
+    roomTimers.delete(roomId);
+  }
+}
+
+// 统一处理操作结果
+function handleActionResult(roomId, game, result, player, action) {
+  let actionMsg = '';
+  switch (action) {
+    case 'fold': actionMsg = `${player.name} 弃牌`; break;
+    case 'check': actionMsg = `${player.name} 过牌`; break;
+    case 'call': actionMsg = `${player.name} 跟注 ${result.amount}`; break;
+    case 'raise': actionMsg = `${player.name} 加注 ${result.amount}`; break;
+    case 'allin': actionMsg = `${player.name} 全下 ${result.amount}`; break;
+  }
+  broadcastMessage(roomId, actionMsg);
+
+  if (result.roundEnded) {
+    clearTurnTimer(roomId);
+    broadcastGameState(roomId);
+
+    const lastResults = game.lastResults;
+    if (lastResults) {
+      for (const r of lastResults) {
+        if (r.winAmount > 0) {
+          broadcastMessage(roomId, `🏆 ${r.playerName} 赢得 ${r.winAmount} 筹码${r.handName ? ` (${r.handName})` : ''}`, 'success');
+        }
+      }
+    }
+
+    // 自动进入下一轮
+    setTimeout(() => {
+      if (game.prepareNextRound()) {
+        broadcastMessage(roomId, `--- 准备第 ${game.currentRound + 1}/${game.maxRounds} 轮 ---`, 'phase');
+        // 自动开始下一轮
+        setTimeout(() => {
+          if (game.startRound()) {
+            broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮开始！`, 'success');
+            const nextPlayer = game.getCurrentPlayer();
+            if (nextPlayer) {
+              broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
+            }
+            broadcastGameState(roomId);
+            startTurnTimer(roomId);
+          }
+        }, 1000);
+      } else {
+        // 20轮结束，进入结算
+        broadcastMessage(roomId, '🏁 20轮比赛结束！正在结算...', 'success');
+        broadcastGameState(roomId);
+        clearTurnTimer(roomId);
+      }
+      broadcastGameState(roomId);
+    }, 4000);
+  } else {
+    broadcastGameState(roomId);
+    if (result.phaseChanged) {
+      const phaseNames = { flop: '翻牌', turn: '转牌', river: '河牌', showdown: '摊牌' };
+      broadcastMessage(roomId, `--- ${phaseNames[result.newPhase] || result.newPhase} ---`, 'phase');
+    }
+    const nextPlayer = game.getCurrentPlayer();
+    if (nextPlayer && game.phase !== GAME_PHASES.SHOWDOWN) {
+      broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
+    }
+  }
+}
+
 io.on('connection', (socket) => {
   console.log(`玩家连接: ${socket.id}`);
 
-  // 创建房间
   socket.on('createRoom', (data, callback) => {
     const { playerName } = data;
     const roomId = createRoom();
     const game = rooms.get(roomId);
-
     socket.join(roomId);
     const result = game.addPlayer(socket.id, playerName);
-
     if (result.success) {
       playerRooms.set(socket.id, roomId);
       callback({ success: true, roomId, seatIndex: result.seatIndex });
@@ -67,20 +163,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 加入房间
   socket.on('joinRoom', (data, callback) => {
     const { roomId, playerName } = data;
     const upperRoomId = roomId.toUpperCase();
     const game = rooms.get(upperRoomId);
-
-    if (!game) {
-      callback({ success: false, message: '房间不存在' });
-      return;
-    }
+    if (!game) { callback({ success: false, message: '房间不存在' }); return; }
 
     socket.join(upperRoomId);
     const result = game.addPlayer(socket.id, playerName);
-
     if (result.success) {
       playerRooms.set(socket.id, upperRoomId);
       callback({ success: true, roomId: upperRoomId, seatIndex: result.seatIndex });
@@ -91,14 +181,11 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 快速加入（加入任意有空位的房间或创建新房间）
   socket.on('quickJoin', (data, callback) => {
     const { playerName } = data;
     let joined = false;
-
-    // 寻找有空位的房间
     for (const [roomId, game] of rooms) {
-      if (game.playerCount < 7 && game.phase === GAME_PHASES.WAITING) {
+      if (game.playerCount < 7 && (game.phase === GAME_PHASES.WAITING || !game.isGameStarted)) {
         socket.join(roomId);
         const result = game.addPlayer(socket.id, playerName);
         if (result.success) {
@@ -111,9 +198,7 @@ io.on('connection', (socket) => {
         }
       }
     }
-
     if (!joined) {
-      // 创建新房间
       const roomId = createRoom();
       const game = rooms.get(roomId);
       socket.join(roomId);
@@ -127,7 +212,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 准备
+  // 准备（首轮需要准备，后续自动）
   socket.on('ready', (callback) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return;
@@ -141,18 +226,17 @@ io.on('connection', (socket) => {
     broadcastGameState(roomId);
     broadcastMessage(roomId, `${player.name} ${player.isReady ? '已准备' : '取消准备'}`);
 
-    // 检查是否可以自动开始
     if (game.canStartGame()) {
       setTimeout(() => {
         if (game.canStartGame()) {
           game.startGame();
           broadcastGameState(roomId);
-          broadcastMessage(roomId, '🎴 游戏开始！', 'success');
-
+          broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮开始！`, 'success');
           const currentPlayer = game.getCurrentPlayer();
           if (currentPlayer) {
             broadcastMessage(roomId, `等待 ${currentPlayer.name} 操作...`);
           }
+          startTurnTimer(roomId);
         }
       }, 1000);
     }
@@ -174,56 +258,39 @@ io.on('connection', (socket) => {
     const result = game.playerAction(socket.id, action, amount || 0);
 
     if (result.success) {
-      let actionMsg = '';
-      switch (action) {
-        case 'fold': actionMsg = `${player.name} 弃牌`; break;
-        case 'check': actionMsg = `${player.name} 过牌`; break;
-        case 'call': actionMsg = `${player.name} 跟注 ${result.amount}`; break;
-        case 'raise': actionMsg = `${player.name} 加注 ${result.amount}`; break;
-        case 'allin': actionMsg = `${player.name} 全下 ${result.amount}`; break;
-      }
-      broadcastMessage(roomId, actionMsg);
-
-      if (result.roundEnded) {
-        broadcastGameState(roomId);
-        const lastResults = game.lastResults;
-        if (lastResults) {
-          for (const r of lastResults) {
-            if (r.winAmount > 0) {
-              broadcastMessage(
-                roomId,
-                `🏆 ${r.playerName} 赢得 ${r.winAmount} 筹码${r.handName ? ` (${r.handName})` : ''}`,
-                'success'
-              );
-            }
-          }
-        }
-
-        // 5秒后重置
-        setTimeout(() => {
-          game.resetForNewRound();
-          broadcastGameState(roomId);
-          broadcastMessage(roomId, '准备下一局，请点击"准备"按钮');
-        }, 5000);
-      } else {
-        broadcastGameState(roomId);
-        if (result.phaseChanged) {
-          const phaseNames = {
-            flop: '翻牌',
-            turn: '转牌',
-            river: '河牌',
-            showdown: '摊牌',
-          };
-          broadcastMessage(roomId, `--- ${phaseNames[result.newPhase] || result.newPhase} ---`, 'phase');
-        }
-        const nextPlayer = game.getCurrentPlayer();
-        if (nextPlayer && game.phase !== GAME_PHASES.SHOWDOWN) {
-          broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
-        }
-      }
+      handleActionResult(roomId, game, result, player, action);
     }
 
     if (typeof callback === 'function') callback(result);
+  });
+
+  // 重购积分
+  socket.on('rebuy', (callback) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    const game = rooms.get(roomId);
+    if (!game) return;
+
+    const result = game.playerRebuy(socket.id);
+    if (result.success) {
+      const player = game.players.get(socket.id);
+      broadcastMessage(roomId, `💰 ${player.name} 重购了 ${result.amount} 筹码`);
+      broadcastGameState(roomId);
+    }
+    if (typeof callback === 'function') callback(result);
+  });
+
+  // 重新开始整场
+  socket.on('restart', (callback) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    const game = rooms.get(roomId);
+    if (!game) return;
+
+    game.restartGame();
+    broadcastMessage(roomId, '🔄 比赛已重置，请重新准备', 'success');
+    broadcastGameState(roomId);
+    if (typeof callback === 'function') callback({ success: true });
   });
 
   // 聊天
@@ -232,7 +299,6 @@ io.on('connection', (socket) => {
     if (!roomId) return;
     const game = rooms.get(roomId);
     if (!game) return;
-
     const player = game.players.get(socket.id);
     if (!player) return;
 
@@ -243,12 +309,10 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 断开连接
   socket.on('disconnect', () => {
     console.log(`玩家断开: ${socket.id}`);
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return;
-
     const game = rooms.get(roomId);
     if (!game) return;
 
@@ -261,8 +325,8 @@ io.on('connection', (socket) => {
     broadcastMessage(roomId, `${playerName} 离开了房间`);
     broadcastGameState(roomId);
 
-    // 如果房间空了，删除房间
     if (game.playerCount === 0) {
+      clearTurnTimer(roomId);
       rooms.delete(roomId);
       console.log(`房间 ${roomId} 已删除`);
     }
