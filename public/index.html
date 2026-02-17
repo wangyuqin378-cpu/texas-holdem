@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>德州扑克 - 在线多人</title>
+  <link rel="stylesheet" href="styles.css">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <!-- 登录界面 -->
+  <div id="lobby" class="screen active">
+    <div class="lobby-container">
+      <div class="lobby-header">
+        <div class="logo">
+          <span class="logo-icon">🃏</span>
+          <h1>德州扑克</h1>
+          <p class="subtitle">在线多人对战 · 最多7人</p>
+        </div>
+      </div>
+
+      <div class="lobby-form">
+        <div class="input-group">
+          <label for="playerName">你的昵称</label>
+          <input type="text" id="playerName" placeholder="输入昵称" maxlength="12" autocomplete="off">
+        </div>
+
+        <div class="lobby-buttons">
+          <button id="btnQuickJoin" class="btn btn-primary btn-large">
+            <span class="btn-icon">⚡</span>快速加入
+          </button>
+          <button id="btnCreateRoom" class="btn btn-secondary">
+            <span class="btn-icon">➕</span>创建房间
+          </button>
+          <div class="join-room-row">
+            <input type="text" id="roomIdInput" placeholder="房间号" maxlength="6" autocomplete="off">
+            <button id="btnJoinRoom" class="btn btn-secondary">加入房间</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 游戏界面 -->
+  <div id="gameScreen" class="screen">
+    <!-- 顶部栏 -->
+    <div class="top-bar">
+      <div class="room-info">
+        <span class="room-label">房间</span>
+        <span id="roomIdDisplay" class="room-id"></span>
+        <button id="btnCopyRoom" class="btn-icon-small" title="复制房间号">📋</button>
+      </div>
+      <div class="player-count">
+        <span id="playerCountDisplay">0/7</span>
+      </div>
+      <button id="btnLeave" class="btn btn-danger btn-small">离开</button>
+    </div>
+
+    <!-- 牌桌 -->
+    <div class="table-container">
+      <div class="poker-table">
+        <!-- 玩家座位 (通过 JS 动态生成) -->
+        <div id="seats"></div>
+
+        <!-- 公共牌区 -->
+        <div class="community-area">
+          <div id="communityCards" class="community-cards"></div>
+          <div id="potDisplay" class="pot-display">底池: 0</div>
+        </div>
+
+        <!-- 庄家标记 -->
+        <div id="dealerChip" class="dealer-chip hidden">D</div>
+      </div>
+    </div>
+
+    <!-- 操作区 -->
+    <div id="actionBar" class="action-bar hidden">
+      <div class="action-buttons">
+        <button id="btnFold" class="btn btn-action btn-fold" data-action="fold">
+          弃牌
+        </button>
+        <button id="btnCheck" class="btn btn-action btn-check" data-action="check">
+          过牌
+        </button>
+        <button id="btnCall" class="btn btn-action btn-call" data-action="call">
+          跟注
+        </button>
+        <button id="btnRaise" class="btn btn-action btn-raise" data-action="raise">
+          加注
+        </button>
+        <button id="btnAllIn" class="btn btn-action btn-allin" data-action="allin">
+          全下
+        </button>
+      </div>
+      <div class="raise-controls hidden" id="raiseControls">
+        <input type="range" id="raiseSlider" min="0" max="1000" value="0">
+        <div class="raise-amount-row">
+          <input type="number" id="raiseAmount" min="0" value="0">
+          <button id="btnConfirmRaise" class="btn btn-primary btn-small">确认加注</button>
+        </div>
+        <div class="raise-presets">
+          <button class="btn btn-preset" data-multiplier="0.5">1/2 底池</button>
+          <button class="btn btn-preset" data-multiplier="0.75">3/4 底池</button>
+          <button class="btn btn-preset" data-multiplier="1">满池</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 准备按钮 -->
+    <div id="readyBar" class="ready-bar">
+      <button id="btnReady" class="btn btn-primary btn-large">准备</button>
+    </div>
+
+    <!-- 消息区 -->
+    <div id="messageLog" class="message-log">
+      <div id="messages" class="messages"></div>
+      <div class="chat-input-row">
+        <input type="text" id="chatInput" placeholder="输入消息..." maxlength="100">
+        <button id="btnSendChat" class="btn btn-small">发送</button>
+      </div>
+    </div>
+
+    <!-- 结果弹窗 -->
+    <div id="resultOverlay" class="result-overlay hidden">
+      <div class="result-content">
+        <h2 id="resultTitle"></h2>
+        <div id="resultDetails"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
