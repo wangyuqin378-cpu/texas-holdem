@@ -365,6 +365,32 @@ io.on('connection', (socket) => {
     if (typeof callback === 'function') callback({ success: true });
   });
 
+
+  // 确认总结（20轮结束后）
+  socket.on('confirmSettlement', (callback) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    const game = rooms.get(roomId);
+    if (!game) return;
+
+    const player = game.players.get(socket.id);
+    if (!player) return;
+
+    const result = game.playerConfirmSettlement(socket.id);
+    if (!result.success) {
+      if (typeof callback === 'function') callback(result);
+      return;
+    }
+
+    broadcastMessage(roomId, `✅ ${player.name} 已确认总结 (${game.confirmedSettlement.size}/${game.players.size})`);
+    broadcastGameState(roomId);
+
+    if (game.allConfirmedSettlement) {
+      broadcastMessage(roomId, '🎉 全员确认！现在可以开始新的比赛了', 'success');
+    }
+
+    if (typeof callback === 'function') callback({ success: true });
+  });
   // 玩家操作
   socket.on('action', (data, callback) => {
     const roomId = playerRooms.get(socket.id);
@@ -407,11 +433,21 @@ io.on('connection', (socket) => {
   });
 
   // 重新开始整场
-  socket.on('restart', (callback) => {
+socket.on('restart', (callback) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return;
     const game = rooms.get(roomId);
     if (!game) return;
+
+    // 在 SETTLED 阶段需要所有人确认后才能重启
+    if (game.phase === GAME_PHASES.SETTLED) {
+      if (!game.allConfirmedSettlement) {
+        if (typeof callback === 'function') {
+          callback({ success: false, message: '需要所有玩家确认总结后才能重新开始' });
+        }
+        return;
+      }
+    }
 
     game.restartGame();
     clearTurnTimer(roomId);

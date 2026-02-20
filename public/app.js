@@ -504,6 +504,7 @@
   function showSettlement(settlement) {
     settlementOverlay.classList.remove('hidden');
     let html = '';
+    html += renderSettlementConfirm();
     settlement.forEach((s, i) => {
       const prefix = s.profit >= 0 ? '+' : '';
       html += `<div class="settlement-row ${i === 0 ? 'top' : ''}">
@@ -527,5 +528,58 @@
     while (messagesEl.children.length > 40) messagesEl.removeChild(messagesEl.firstChild);
   }
 
+// 渲染总结确认按钮
+function renderSettlementConfirm() {
+  const game = state;
+  if (game.phase !== 'settled') return '';
+  
+  const confirmedSet = game.confirmedSettlement || new Set();
+  const confirmed = confirmedSet.has(socket.id);
+  const confirmedCount = confirmedSet.size;
+  const totalPlayers = game.players.length;
+  const allConfirmed = confirmedCount === totalPlayers;
+  
+  let html = '<div class="settlement-confirm">';
+  
+  if (!confirmed) {
+    html += '<button class="btn-confirm" onclick="confirmSettlement()">✅ 确认总结</button>';
+    html += '<p class="hint">查看完排名后请点击确认</p>';
+  } else {
+    html += '<p class="confirmed-text">✅ 你已确认</p>';
+  }
+  
+  html += `<p class="progress">已确认: ${confirmedCount}/${totalPlayers}</p>`;
+  
+  if (allConfirmed) {
+    html += '<button class="btn-restart" onclick="restartGame()">🔄 开始新的比赛</button>';
+  } else {
+    html += '<p class="waiting">等待其他玩家确认...</p>';
+  }
+  
+  html += '</div>';
+  return html;
+}
+
+// 确认总结
+function confirmSettlement() {
+  socket.emit('confirmSettlement', (response) => {
+    if (!response || !response.success) {
+      alert(response?.message || '确认失败');
+    }
+  });
+}
+
+// 重新开始游戏
+function restartGame() {
+  if (!confirm('确定要开始新的 20 轮比赛吗？')) {
+    return;
+  }
+  
+  socket.emit('restart', (response) => {
+    if (!response || !response.success) {
+      alert(response?.message || '无法重新开始，请稍后再试');
+    }
+  });
+}
   document.addEventListener('DOMContentLoaded', init);
 })();

@@ -363,3 +363,80 @@ input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;hei
   .ready-bar{padding:6px}
   .btn-action{padding:6px 3px;font-size:11px}
 }
+
+/* 总结确认界面 */
+.settlement-confirm {
+  margin: 30px auto;
+  padding: 20px;
+  max-width: 500px;
+  text-align: center;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 12px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+}
+
+.settlement-confirm .btn-confirm,
+.settlement-confirm .btn-restart {
+  padding: 12px 40px;
+  font-size: 18px;
+  font-weight: bold;
+  margin: 10px;
+  cursor: pointer;
+  border: none;
+  border-radius: 8px;
+  background: #4CAF50;
+  color: white;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.settlement-confirm .btn-confirm:hover,
+.settlement-confirm .btn-restart:hover {
+  background: #45a049;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.settlement-confirm .btn-restart {
+  background: #FF9800;
+}
+
+.settlement-confirm .btn-restart:hover {
+  background: #F57C00;
+}
+
+.settlement-confirm .hint {
+  color: #fff;
+  font-size: 14px;
+  margin: 10px 0;
+  opacity: 0.9;
+}
+
+.settlement-confirm .confirmed-text {
+  color: #4CAF50;
+  font-size: 18px;
+  font-weight: bold;
+  margin: 15px 0;
+  background: white;
+  padding: 10px 20px;
+  border-radius: 5px;
+}
+
+.settlement-confirm .progress {
+  color: #fff;
+  font-size: 16px;
+  margin: 15px 0;
+  font-weight: bold;
+}
+
+.settlement-confirm .waiting {
+  color: #FFE082;
+  font-size: 14px;
+  margin: 10px 0;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}

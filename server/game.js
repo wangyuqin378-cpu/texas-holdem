@@ -117,6 +117,9 @@ class Game {
     this.bbSeatIndex = -1;
 
     // SHOWDOWN 确认续局
+    // SETTLED 阶段确认总结
+    this.confirmedSettlement = new Set();
+
     this.confirmedNextPlayers = new Set();
 
     // 是否为实际摊牌（多人对决，非全员弃牌）
@@ -190,6 +193,11 @@ class Game {
       this.confirmedNextPlayers.add(id);
     }
 
+    // SETTLED 阶段，断线玩家自动确认
+    if (this.phase === GAME_PHASES.SETTLED) {
+      this.confirmedSettlement.add(id);
+    }
+
     return { player, roundEnded: false };
   }
 
@@ -220,6 +228,7 @@ class Game {
     this.players.delete(id);
     this.seatOrder = this.seatOrder.filter(pid => pid !== id);
     this.confirmedNextPlayers.delete(id);
+    this.confirmedSettlement.delete(id);
 
     if (this.phase !== GAME_PHASES.WAITING && this.phase !== GAME_PHASES.SETTLED) {
       if (this.phase === GAME_PHASES.SHOWDOWN) {
@@ -775,9 +784,31 @@ class Game {
     return this.players.size >= 1;
   }
 
+  // 玩家确认总结
+  playerConfirmSettlement(playerId) {
+    if (this.phase !== GAME_PHASES.SETTLED) {
+      return { success: false, message: '当前不在总结阶段' };
+    }
+    if (!this.players.has(playerId)) {
+      return { success: false, message: '玩家不存在' };
+    }
+    this.confirmedSettlement.add(playerId);
+    return { success: true };
+  }
+
+  // 检查是否所有人都确认了总结
+  get allConfirmedSettlement() {
+    if (this.phase !== GAME_PHASES.SETTLED) return false;
+    for (const [id] of this.players) {
+      if (!this.confirmedSettlement.has(id)) return false;
+    }
+    return this.players.size >= 1;
+  }
+
   prepareNextRound() {
     if (this.currentRound >= this.maxRounds) {
       this.phase = GAME_PHASES.SETTLED;
+      this.confirmedSettlement.clear();
       return false;
     }
 
@@ -836,6 +867,7 @@ class Game {
     this.sbSeatIndex = -1;
     this.bbSeatIndex = -1;
     this.confirmedNextPlayers.clear();
+    this.confirmedSettlement.clear();
 
     for (const [, player] of this.players) {
       player.chips = INITIAL_CHIPS;
