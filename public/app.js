@@ -144,7 +144,13 @@
 
   // ===== 连接 =====
   function connectSocket() {
-    if (socket) return;
+    if (socket) {
+      // 如果已有连接且需要重连，直接发重连请求
+      if (isReconnecting && socket.connected) {
+        attemptRejoin();
+      }
+      return;
+    }
     socket = io({
       reconnection: true,
       reconnectionAttempts: 50,
@@ -156,24 +162,8 @@
     socket.on('connect', () => {
       myPlayerId = socket.id;
       // 如果之前在房间中，尝试重连
-      const savedRoom = localStorage.getItem('pokerRoom');
-      const savedName = localStorage.getItem('pokerName');
-      if (isReconnecting && savedRoom && savedName) {
-        addMessage('正在重连...', 'info');
-        socket.emit('rejoinRoom', { roomId: savedRoom, playerName: savedName }, (r) => {
-          isReconnecting = false;
-          if (r.success) {
-            myRoomId = r.roomId;
-            mySeatIndex = r.seatIndex;
-            showGame();
-            addMessage('重连成功！', 'success');
-          } else {
-            addMessage('重连失败: ' + r.message, 'error');
-            // 重连失败，清除保存的房间信息
-            localStorage.removeItem('pokerRoom');
-            showLobby();
-          }
-        });
+      if (isReconnecting) {
+        attemptRejoin();
       }
     });
 
@@ -187,12 +177,38 @@
     socket.on('chat', (d) => { addMessage(`${d.playerName}: ${d.message}`, 'chat'); });
 
     socket.on('disconnect', () => {
-      // 不立即回大厅，标记重连中
+      // 不立即回大厅，标记重连中（Socket.IO 会自动重连 transport）
       const savedRoom = localStorage.getItem('pokerRoom');
       if (savedRoom && myRoomId) {
         isReconnecting = true;
         addMessage('连接断开，正在尝试重连...', 'warning');
       } else {
+        showLobby();
+      }
+    });
+  }
+
+  // 尝试重新加入房间
+  function attemptRejoin() {
+    const savedRoom = localStorage.getItem('pokerRoom');
+    const savedName = localStorage.getItem('pokerName');
+    if (!savedRoom || !savedName) {
+      isReconnecting = false;
+      showLobby();
+      return;
+    }
+    addMessage('正在重连...', 'info');
+    socket.emit('rejoinRoom', { roomId: savedRoom, playerName: savedName }, (r) => {
+      isReconnecting = false;
+      if (r.success) {
+        myRoomId = r.roomId;
+        mySeatIndex = r.seatIndex;
+        showGame();
+        addMessage('重连成功！', 'success');
+      } else {
+        // 重连失败，清除保存的房间信息，回到大厅
+        addMessage('重连失败: ' + r.message, 'error');
+        localStorage.removeItem('pokerRoom');
         showLobby();
       }
     });

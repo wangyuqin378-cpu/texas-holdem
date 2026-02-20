@@ -620,33 +620,66 @@ class Game {
   }
 
   calculateWinnings(contenders) {
-    const results = [];
+    // 计算每个玩家本轮的总投注（包含所有阶段）
+    // 使用 totalBetThisRound 来追踪
+    const allParticipants = this.seatOrder
+      .map(id => this.players.get(id))
+      .filter(p => p);
+
+    // 收集每个参与者的总投注
+    const playerBets = [];
+    for (const p of allParticipants) {
+      playerBets.push({ id: p.id, totalBet: p.totalBetThisRound, status: p.status });
+    }
+
+    // 计算边池：按总投注额从小到大排序，逐级切分
+    const sidePots = this._buildSidePots(playerBets);
+
+    // 评估还在对决中的玩家的牌力
     const evaluatedPlayers = contenders.map(p => {
       const allCards = [...p.holeCards, ...this.communityCards];
       const hand = evaluateBestHand(allCards);
-      return { ...p, hand, allCards };
+      return { id: p.id, name: p.name, hand, holeCards: p.holeCards };
     });
 
-    const winners = determineWinners(
-      evaluatedPlayers.map(p => ({
-        id: p.id,
-        cards: [...p.holeCards, ...this.communityCards],
-      }))
-    );
+    // 每个玩家的赢利
+    const winnings = {};
+    for (const ep of evaluatedPlayers) {
+      winnings[ep.id] = 0;
+    }
 
-    const winnerIds = new Set(winners.map(w => w.id));
-    const winAmount = Math.floor(this.pot / winners.length);
-    const remainder = this.pot - winAmount * winners.length;
+    // 对每个边池分别决定赢家
+    for (const pot of sidePots) {
+      // 在该边池有资格竞争的玩家 = 在 contenders 中且在 eligible 列表中
+      const eligible = evaluatedPlayers.filter(ep => pot.eligible.has(ep.id));
+      if (eligible.length === 0) continue;
 
+      // 从有资格的玩家中决出赢家
+      const potWinners = determineWinners(
+        eligible.map(ep => ({
+          id: ep.id,
+          cards: [...ep.holeCards, ...this.communityCards],
+        }))
+      );
+
+      const winPerPlayer = Math.floor(pot.amount / potWinners.length);
+      const remainder = pot.amount - winPerPlayer * potWinners.length;
+
+      for (let i = 0; i < potWinners.length; i++) {
+        let amt = winPerPlayer;
+        if (i === 0) amt += remainder;
+        winnings[potWinners[i].id] += amt;
+      }
+    }
+
+    // 分配筹码并构建结果
+    const results = [];
     for (const ep of evaluatedPlayers) {
       const player = this.players.get(ep.id);
-      let amount = 0;
-      if (winnerIds.has(ep.id)) {
-        amount = winAmount;
-        if (ep.id === winners[0].id) amount += remainder;
+      const amount = winnings[ep.id] || 0;
+      if (amount > 0) {
         player.chips += amount;
       }
-
       results.push({
         playerId: ep.id,
         playerName: ep.name,
@@ -658,6 +691,67 @@ class Game {
     }
 
     return results;
+  }
+
+  /**
+   * 构建边池列表
+   * 标准算法：按投注额从小到大依次"切"出边池
+   * 返回: [{ amount, eligible: Set<playerId> }, ...]
+   */
+  _buildSidePots(playerBets) {
+    // 过滤掉投注为0的（纯旁观者）
+    const bets = playerBets
+      .filter(pb => pb.totalBet > 0)
+      .map(pb => ({ ...pb }));
+
+    if (bets.length === 0) return [];
+
+    // 按总投注额排序
+    bets.sort((a, b) => a.totalBet - b.totalBet);
+
+    const pots = [];
+    let prevLevel = 0;
+
+    for (let i = 0; i < bets.length; i++) {
+      const currentLevel = bets[i].totalBet;
+      const diff = currentLevel - prevLevel;
+
+      if (diff > 0) {
+        // 从所有投注额 >= currentLevel 的玩家处各收 diff
+        const eligible = new Set();
+        let potAmount = 0;
+        for (const b of bets) {
+          if (b.totalBet >= currentLevel) {
+            potAmount += diff;
+            eligible.add(b.id);
+          }
+        }
+        // 只有未弃牌的玩家才有资格赢
+        const activeEligible = new Set();
+        for (const id of eligible) {
+          const p = this.players.get(id);
+          if (p && (p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.ALL_IN)) {
+            activeEligible.add(id);
+          }
+        }
+        // 如果没有活跃玩家有资格，把筹码给投入最多的活跃玩家
+        if (activeEligible.size > 0) {
+          pots.push({ amount: potAmount, eligible: activeEligible });
+        } else {
+          // 理论上不会出现，但兜底：给第一个活跃玩家
+          const fallback = bets.find(b => {
+            const p = this.players.get(b.id);
+            return p && (p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.ALL_IN);
+          });
+          if (fallback) {
+            pots.push({ amount: potAmount, eligible: new Set([fallback.id]) });
+          }
+        }
+      }
+      prevLevel = currentLevel;
+    }
+
+    return pots;
   }
 
   // 玩家确认下一局
