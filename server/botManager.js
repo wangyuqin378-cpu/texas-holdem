@@ -68,63 +68,40 @@ class BotManager {
   }
 
   /**
-   * 检查当前玩家是否是机器人,如果是则触发行动
+   * 检查当前玩家是否是机器人，如果是则执行决策并返回结果
+   * 由外部 handleActionResult 处理后续流转（广播状态、阶段推进、触发下一个机器人）
+   * @returns {{ result, player, action }|null}
    */
   async checkAndActBot(gameState) {
     const currentPlayerId = gameState.currentPlayerId;
-    if (!currentPlayerId) return;
+    if (!currentPlayerId) return null;
 
     const bot = this.bots.get(currentPlayerId);
-    if (!bot) return; // 不是机器人
+    if (!bot) return null; // 不是机器人
 
-    // 添加到行动队列
-    this.actionQueue.push({ bot, gameState });
-    
-    // 开始处理队列
-    if (!this.isProcessing) {
-      this.processActionQueue();
-    }
-  }
+    const player = this.game.players.get(bot.id);
+    if (!player) return null;
 
-  /**
-   * 处理机器人行动队列(串行)
-   */
-  async processActionQueue() {
-    if (this.isProcessing || this.actionQueue.length === 0) return;
-    
-    this.isProcessing = true;
+    try {
+      // 机器人决策（含模拟思考延迟）
+      const decision = await bot.makeDecision(gameState, player);
 
-    while (this.actionQueue.length > 0) {
-      const { bot, gameState } = this.actionQueue.shift();
-      
-      try {
-        const player = this.game.players.get(bot.id);
-        if (!player) continue;
+      // 执行行动
+      const result = this.game.playerAction(bot.id, decision.action, decision.amount || 0);
 
-        // 机器人决策
-        const decision = await bot.makeDecision(gameState, player);
-        
-        // 执行行动
-        const result = this.game.playerAction(bot.id, decision.action, decision.amount || 0);
-        
-        if (result.success) {
-          // 广播行动消息
-          this.broadcastBotAction(bot, decision, result);
-          
-          // 更新所有机器人的对手记忆
-          this.updateAllBotsMemory(bot.id, decision.action, decision.amount || 0, gameState.pot);
-          
-          // 如果本轮结束,通知外部
-          if (result.roundEnded || result.phaseChanged) {
-            // 由外部的 server/index.js 处理轮次结束逻辑
-          }
-        }
-      } catch (error) {
-        console.error(`机器人行动错误: ${bot.name}`, error);
+      if (result.success) {
+        // 广播行动消息
+        this.broadcastBotAction(bot, decision, result);
+
+        // 更新所有机器人的对手记忆
+        this.updateAllBotsMemory(bot.id, decision.action, decision.amount || 0, gameState.pot);
       }
-    }
 
-    this.isProcessing = false;
+      return { result, player, action: decision.action };
+    } catch (error) {
+      console.error(`机器人行动错误: ${bot.name}`, error);
+      return null;
+    }
   }
 
   /**
@@ -212,9 +189,30 @@ class BotManager {
   }
 
   /**
+   * 所有机器人自动重购（筹码为0时）
+   */
+  autoRebuyAll() {
+    for (const botId of this.bots.keys()) {
+      const player = this.game.players.get(botId);
+      if (player && player.chips === 0) {
+        const result = this.game.playerRebuy(botId);
+        if (result.success) {
+          this.io.to(this.roomId).emit('message', {
+            text: `💰 ${player.name} 重购了 ${result.amount} 筹码`,
+            type: 'info',
+            timestamp: Date.now()
+          });
+        }
+      }
+    }
+  }
+
+  /**
    * 所有机器人准备
    */
   async allBotsReady() {
+    // 准备前先自动重购
+    this.autoRebuyAll();
     const promises = [];
     for (const botId of this.bots.keys()) {
       promises.push(this.botReady(botId));

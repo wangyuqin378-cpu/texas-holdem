@@ -134,10 +134,15 @@ async function enterShowdown(roomId, game) {
 async function tryStartNextRound(roomId, game) {
   const botManager = botManagers.get(roomId);
   
+  // 机器人自动重购（筹码为0时）
+  if (botManager) {
+    botManager.autoRebuyAll();
+  }
+
   if (!game.prepareNextRound()) {
     broadcastMessage(roomId, '🏁 20轮结束！查看结算', 'success');
     broadcastGameState(roomId);
-    
+
     // 机器人自动确认总结
     if (botManager) {
       await botManager.allBotsConfirmSettlement();
@@ -165,8 +170,19 @@ async function tryStartNextRound(roomId, game) {
   
   // 检查首个玩家是否是机器人
   if (nextPlayer && botManager && botManager.isBot(nextPlayer.id)) {
-    const state = game.getState(nextPlayer.id);
-    await botManager.checkAndActBot(state);
+    await triggerBotAction(roomId, game, botManager);
+  }
+}
+
+// 触发机器人行动并通过 handleActionResult 处理后续流转
+async function triggerBotAction(roomId, game, botManager) {
+  const currentPlayer = game.getCurrentPlayer();
+  if (!currentPlayer || !botManager.isBot(currentPlayer.id)) return;
+
+  const state = game.getState(currentPlayer.id);
+  const botResult = await botManager.checkAndActBot(state);
+  if (botResult && botResult.result && botResult.result.success) {
+    await handleActionResult(roomId, game, botResult.result, botResult.player, botResult.action);
   }
 }
 
@@ -204,8 +220,7 @@ async function handleActionResult(roomId, game, result, player, action) {
       
       // 检查是否轮到机器人,如果是则触发行动
       if (botManager && botManager.isBot(nextPlayer.id)) {
-        const state = game.getState(nextPlayer.id);
-        await botManager.checkAndActBot(state);
+        await triggerBotAction(roomId, game, botManager);
       }
     }
   }
@@ -364,8 +379,16 @@ io.on('connection', (socket) => {
 
     const difficulty = data?.difficulty || 'medium';
     const result = botManager.addBot(difficulty);
-    
+
     if (result.success) {
+      // 如果在 SHOWDOWN 阶段添加，自动确认下一局，避免卡住流程
+      if (game.phase === GAME_PHASES.SHOWDOWN) {
+        game.confirmedNextPlayers.add(result.socketId);
+      }
+      // 如果在 SETTLED 阶段添加，自动确认结算
+      if (game.phase === GAME_PHASES.SETTLED) {
+        game.confirmedSettlement.add(result.socketId);
+      }
       broadcastGameState(roomId);
       broadcastMessage(roomId, `🤖 ${result.bot.name} 加入了房间`);
       if (typeof callback === 'function') callback({ success: true, botName: result.bot.name });
@@ -447,8 +470,7 @@ io.on('connection', (socket) => {
           
           // 检查首个玩家是否是机器人
           if (currentPlayer && botManager && botManager.isBot(currentPlayer.id)) {
-            const state = game.getState(currentPlayer.id);
-            await botManager.checkAndActBot(state);
+            await triggerBotAction(roomId, game, botManager);
           }
         }
       }, 1000);

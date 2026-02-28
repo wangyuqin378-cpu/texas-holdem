@@ -161,10 +161,21 @@ class Game {
 
     const player = new Player(id, name, seatIndex);
     this.players.set(id, player);
-    this.seatOrder.push(id);
-    this.seatOrder.sort((a, b) => {
-      return this.players.get(a).seatIndex - this.players.get(b).seatIndex;
-    });
+
+    // 游戏进行中不修改 seatOrder，避免破坏当前轮次的索引
+    // 新玩家会在下一轮 startRound() 时自动加入
+    const isActiveRound = this.phase !== GAME_PHASES.WAITING
+      && this.phase !== GAME_PHASES.SETTLED
+      && this.phase !== GAME_PHASES.SHOWDOWN;
+
+    if (isActiveRound) {
+      player.status = PLAYER_STATUS.SITTING_OUT;
+    } else {
+      this.seatOrder.push(id);
+      this.seatOrder.sort((a, b) => {
+        return this.players.get(a).seatIndex - this.players.get(b).seatIndex;
+      });
+    }
 
     return { success: true, player, seatIndex };
   }

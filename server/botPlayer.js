@@ -110,28 +110,27 @@ class BotPlayer {
    * 简单策略:纯基于牌力和赔率
    */
   _easyStrategy(handStrength, potOdds, availableActions, callAmount, player) {
-    const { foldThreshold, callThreshold, raiseThreshold } = this.config;
+    // 可以免费看牌就不弃牌
+    if (availableActions.includes('check') && handStrength < 0.5) {
+      return { action: 'check' };
+    }
 
-    // 牌力太弱 -> 弃牌
-    if (handStrength < foldThreshold) {
+    // 牌力太弱 -> 弃牌（底部 60%）
+    if (handStrength < 0.40) {
       if (availableActions.includes('check')) return { action: 'check' };
       return { action: 'fold' };
     }
 
-    // 牌力中等 -> 跟注
-    if (handStrength < callThreshold) {
-      // 赔率不好时弃牌
-      if (potOdds < 0.25 && callAmount > player.chips * 0.2) {
-        return { action: 'fold' };
-      }
+    // 牌力中等 -> 跟注（40%-60%）
+    if (handStrength < 0.60) {
       if (availableActions.includes('check')) return { action: 'check' };
       if (availableActions.includes('call')) return { action: 'call' };
       return { action: 'fold' };
     }
 
     // 牌力很强 -> 加注或全下
-    if (handStrength >= raiseThreshold) {
-      if (Math.random() < 0.3 && availableActions.includes('allin')) {
+    if (handStrength >= 0.75) {
+      if (Math.random() < 0.2 && availableActions.includes('allin')) {
         return { action: 'allin' };
       }
       if (availableActions.includes('raise')) {
@@ -142,158 +141,134 @@ class BotPlayer {
     }
 
     // 默认:跟注或过牌
-    if (availableActions.includes('check')) return { action: 'check' };
     if (availableActions.includes('call')) return { action: 'call' };
+    if (availableActions.includes('check')) return { action: 'check' };
     return { action: 'fold' };
   }
 
   /**
    * 中等策略:加入位置、对手分析、适度诈唬
    */
-  _mediumStrategy(handStrength, potOdds, positionValue, opponentProfile, 
+  _mediumStrategy(handStrength, potOdds, positionValue, opponentProfile,
                   availableActions, callAmount, player, gameState) {
-    const { bluffFrequency, foldThreshold, callThreshold, raiseThreshold } = this.config;
+    const { bluffFrequency } = this.config;
 
-    // 位置调整后的牌力
-    const adjustedStrength = handStrength + (positionValue * 0.1);
+    // 位置调整后的牌力（晚位加分最多+0.08）
+    const adjustedStrength = handStrength + (positionValue * 0.08);
+
+    // 可以免费看牌
+    if (availableActions.includes('check') && adjustedStrength < 0.60) {
+      return { action: 'check' };
+    }
 
     // 诈唬机会:在晚位且对手表现弱时
-    const shouldBluff = Math.random() < bluffFrequency 
-                        && positionValue > 0.6 
+    const shouldBluff = Math.random() < bluffFrequency
+                        && positionValue > 0.6
                         && opponentProfile.averageAggression < 0.4;
 
-    if (shouldBluff && handStrength > 0.2) {
+    if (shouldBluff && handStrength > 0.30) {
       if (availableActions.includes('raise')) {
         const raiseAmount = this._calculateRaiseAmount(player, callAmount, 'moderate');
         return { action: 'raise', amount: raiseAmount };
       }
     }
 
-    // 对抗激进对手:更谨慎
-    const effectiveFoldThreshold = opponentProfile.averageAggression > 0.7 
-      ? foldThreshold + 0.1 
-      : foldThreshold;
-
-    if (adjustedStrength < effectiveFoldThreshold) {
-      if (availableActions.includes('check')) return { action: 'check' };
-      // 便宜跟注(pot odds好)
-      if (potOdds > 0.4 && callAmount < player.chips * 0.1 && availableActions.includes('call')) {
-        return { action: 'call' };
-      }
-      return { action: 'fold' };
-    }
-
-    // 中等牌力:根据赔率和对手风格决定
-    if (adjustedStrength < callThreshold) {
-      if (potOdds > 0.3 || callAmount < player.chips * 0.15) {
-        if (availableActions.includes('call')) return { action: 'call' };
-        if (availableActions.includes('check')) return { action: 'check' };
-      }
+    // 弱牌弃牌（底部 55%）
+    if (adjustedStrength < 0.45) {
       if (availableActions.includes('check')) return { action: 'check' };
       return { action: 'fold' };
     }
 
-    // 强牌:加注或全下
-    if (adjustedStrength >= raiseThreshold) {
-      // 超强牌:有概率全下
-      if (adjustedStrength > 0.9 && Math.random() < 0.4 && availableActions.includes('allin')) {
-        return { action: 'allin' };
-      }
-      if (availableActions.includes('raise')) {
-        const raiseAmount = this._calculateRaiseAmount(player, callAmount, 'aggressive');
-        return { action: 'raise', amount: raiseAmount };
-      }
+    // 中等牌力（45%-65%）：跟注
+    if (adjustedStrength < 0.65) {
+      if (availableActions.includes('check')) return { action: 'check' };
+      // 跟注代价太大时弃牌
+      if (callAmount > player.chips * 0.2) return { action: 'fold' };
       if (availableActions.includes('call')) return { action: 'call' };
+      return { action: 'fold' };
     }
 
-    // 默认
+    // 强牌（>65%）:加注或全下
+    if (adjustedStrength > 0.85 && Math.random() < 0.3 && availableActions.includes('allin')) {
+      return { action: 'allin' };
+    }
+    if (availableActions.includes('raise')) {
+      const raiseAmount = this._calculateRaiseAmount(player, callAmount, 'aggressive');
+      return { action: 'raise', amount: raiseAmount };
+    }
     if (availableActions.includes('call')) return { action: 'call' };
-    if (availableActions.includes('check')) return { action: 'check' };
     return { action: 'fold' };
   }
 
   /**
    * 困难策略:GTO近似 + 动态平衡
+   * 翻牌前弃牌约 50-60%，翻牌后根据牌力动态调整
    */
   _hardStrategy(handStrength, potOdds, positionValue, opponentProfile,
                 availableActions, callAmount, player, gameState) {
     const { phase, pot } = gameState;
-    
-    // GTO范围:根据阶段动态调整
-    const gtoRanges = this._getGTORanges(phase, positionValue);
-    
-    // 平衡诈唬和价值下注
-    const bluffRange = gtoRanges.bluff;
-    const valueRange = gtoRanges.value;
-    
-    // 极化策略:要么强牌价值下注,要么诈唬,避免中等牌慢打
-    const shouldPolarize = positionValue > 0.5 && opponentProfile.foldRate > 0.4;
-    
-    if (shouldPolarize) {
-      // 强牌
-      if (handStrength >= valueRange.min) {
-        if (availableActions.includes('raise')) {
-          // 大pot时下大注
-          const sizing = pot > player.chips * 0.5 ? 'large' : 'aggressive';
-          const raiseAmount = this._calculateRaiseAmount(player, callAmount, sizing);
-          return { action: 'raise', amount: raiseAmount };
-        }
-        if (availableActions.includes('call')) return { action: 'call' };
-      }
-      
-      // 诈唬范围
-      if (handStrength >= bluffRange.min && handStrength <= bluffRange.max 
-          && Math.random() < 0.25) {
-        if (availableActions.includes('raise')) {
-          const raiseAmount = this._calculateRaiseAmount(player, callAmount, 'moderate');
-          return { action: 'raise', amount: raiseAmount };
-        }
+
+    // 可以免费看牌
+    if (availableActions.includes('check') && handStrength < 0.65) {
+      // 强牌偶尔慢打
+      if (handStrength > 0.55 && Math.random() < 0.15) {
+        // fall through to raise logic
+      } else {
+        return { action: 'check' };
       }
     }
 
-    // 防守vs激进对手:更多跟注
-    if (opponentProfile.averageAggression > 0.7) {
-      if (handStrength > 0.35 && potOdds > 0.25) {
-        if (availableActions.includes('call')) return { action: 'call' };
-      }
-    }
+    // GTO范围:根据阶段和位置动态调整弃牌线
+    // 翻牌前紧一些，翻牌后可以松一点（因为有更准确的牌力评估）
+    const foldLine = phase === 'pre_flop'
+      ? 0.50 - positionValue * 0.08   // 翻牌前: 0.42~0.50
+      : 0.35 - positionValue * 0.05;  // 翻牌后: 0.30~0.35
 
-    // 标准GTO决策树
-    if (handStrength < 0.25) {
-      if (availableActions.includes('check')) return { action: 'check' };
-      if (potOdds > 0.5 && callAmount < player.chips * 0.05) {
-        if (availableActions.includes('call')) return { action: 'call' };
-      }
-      return { action: 'fold' };
-    }
+    const callLine = phase === 'pre_flop' ? 0.65 : 0.55;
+    const raiseLine = phase === 'pre_flop' ? 0.72 : 0.65;
 
-    if (handStrength < 0.5) {
-      if (potOdds > 0.3 || callAmount < player.chips * 0.1) {
-        if (availableActions.includes('call')) return { action: 'call' };
-      }
-      if (availableActions.includes('check')) return { action: 'check' };
-      return { action: 'fold' };
-    }
+    // 诈唬: 晚位 + 对手容易弃牌 + 随机 20%
+    const shouldBluff = Math.random() < this.config.bluffFrequency
+                        && positionValue > 0.6
+                        && opponentProfile.foldRate > 0.4
+                        && handStrength > 0.30;
 
-    // 强牌:平衡加注和慢打
-    if (handStrength >= 0.75) {
-      const slowPlayChance = phase === 'flop' ? 0.2 : 0.1; // 翻牌圈偶尔慢打
-      if (Math.random() < slowPlayChance) {
-        if (availableActions.includes('check')) return { action: 'check' };
-        if (availableActions.includes('call')) return { action: 'call' };
-      }
-      
-      if (handStrength > 0.9 && pot > player.chips * 0.3 && availableActions.includes('allin')) {
-        return { action: 'allin' };
-      }
-      
+    if (shouldBluff) {
       if (availableActions.includes('raise')) {
-        const raiseAmount = this._calculateRaiseAmount(player, callAmount, 'aggressive');
+        const raiseAmount = this._calculateRaiseAmount(player, callAmount, 'moderate');
         return { action: 'raise', amount: raiseAmount };
       }
     }
 
-    // 默认
+    // 弱牌弃牌
+    if (handStrength < foldLine) {
+      if (availableActions.includes('check')) return { action: 'check' };
+      return { action: 'fold' };
+    }
+
+    // 中等牌跟注
+    if (handStrength < callLine) {
+      if (availableActions.includes('check')) return { action: 'check' };
+      // 跟注代价太大时弃牌
+      if (callAmount > player.chips * 0.25) return { action: 'fold' };
+      if (availableActions.includes('call')) return { action: 'call' };
+      return { action: 'fold' };
+    }
+
+    // 强牌加注
+    if (handStrength >= raiseLine) {
+      // 超强牌全下
+      if (handStrength > 0.90 && Math.random() < 0.3 && availableActions.includes('allin')) {
+        return { action: 'allin' };
+      }
+      if (availableActions.includes('raise')) {
+        const sizing = pot > player.chips * 0.5 ? 'large' : 'aggressive';
+        const raiseAmount = this._calculateRaiseAmount(player, callAmount, sizing);
+        return { action: 'raise', amount: raiseAmount };
+      }
+    }
+
+    // 介于 callLine 和 raiseLine 之间: 跟注
     if (availableActions.includes('call')) return { action: 'call' };
     if (availableActions.includes('check')) return { action: 'check' };
     return { action: 'fold' };
@@ -304,15 +279,54 @@ class BotPlayer {
    */
   _evaluateHandStrength(holeCards, communityCards) {
     if (!holeCards || holeCards.length !== 2) return 0;
-    
+
     const allCards = [...holeCards];
     if (communityCards && communityCards.length > 0) {
       allCards.push(...communityCards);
     }
-    
+
+    // 翻牌前只有2张手牌，无法用5张牌评估器，改用预估值
+    if (allCards.length < 5) {
+      return this._preFlopStrength(holeCards);
+    }
+
     // 使用handEvaluator获取手牌评分
     const hand = evaluateBestHand(allCards);
     return getHandStrength(hand);
+  }
+
+  /**
+   * 翻牌前手牌强度预估 (0-1)
+   * 基于起手牌的相对价值
+   */
+  _preFlopStrength(holeCards) {
+    const v1 = holeCards[0].value || holeCards[0].v || 0;
+    const v2 = holeCards[1].value || holeCards[1].v || 0;
+    const high = Math.max(v1, v2);
+    const low = Math.min(v1, v2);
+    const isPair = v1 === v2;
+    const isSuited = (holeCards[0].suit === holeCards[1].suit);
+    const gap = high - low;
+
+    let strength = 0;
+
+    if (isPair) {
+      // 对子: AA=0.95, KK=0.9, ..., 22=0.5
+      strength = 0.5 + (high / 14) * 0.45;
+    } else {
+      // 非对子: 基于两张牌的面值
+      strength = ((high + low) / 28) * 0.6;
+      // 同花加分
+      if (isSuited) strength += 0.05;
+      // 连张加分
+      if (gap === 1) strength += 0.04;
+      else if (gap === 2) strength += 0.02;
+      // 大牌加分 (A, K)
+      if (high === 14) strength += 0.08;
+      else if (high === 13) strength += 0.04;
+    }
+
+    return Math.min(1, Math.max(0, strength));
   }
 
   /**

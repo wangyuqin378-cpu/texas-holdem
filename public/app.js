@@ -605,39 +605,39 @@ function restartGame() {
     }
   });
 }
-  document.addEventListener('DOMContentLoaded', init);
-})();
-
   // ===== 机器人管理 =====
   function addBotToEmptySeat() {
     console.log('[DEBUG] addBotToEmptySeat 调用', { socket: !!socket, myRoomId });
-    
+
     if (!socket || !myRoomId) {
-      showMessage('请先加入房间', 'error');
+      addMessage('请先加入房间', 'error');
       console.error('[DEBUG] socket或roomId未初始化');
       return;
     }
-    
+
     console.log('[DEBUG] 发送 addBot 事件');
     // 默认添加困难机器人
     socket.emit('addBot', { difficulty: 'hard' }, (response) => {
       console.log('[DEBUG] addBot 响应:', response);
       if (response && response.success) {
-        showMessage(`🤖 ${response.botName} 已加入`, 'success');
+        addMessage(`🤖 ${response.botName} 已加入`, 'success');
       } else {
-        showMessage(response?.message || '添加机器人失败', 'error');
+        addMessage(response?.message || '添加机器人失败', 'error');
       }
     });
   }
-  
+
   function removeBotById(botId) {
     if (!socket || !myRoomId) return;
-    
+
     socket.emit('removeBot', { botId }, (response) => {
       if (response && response.success) {
-        showMessage('🤖 机器人已移除', 'info');
+        addMessage('🤖 机器人已移除', 'info');
       } else {
-        showMessage(response?.message || '移除失败', 'error');
+        addMessage(response?.message || '移除失败', 'error');
       }
     });
   }
+
+  document.addEventListener('DOMContentLoaded', init);
+})();
