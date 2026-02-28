@@ -90,9 +90,13 @@
     
     // 座位按钮事件委托
     seatsContainer.addEventListener('click', (e) => {
+      console.log('[DEBUG] 座位点击:', e.target.className, e.target.tagName);
+      
       if (e.target.classList.contains('seat-add-bot')) {
+        console.log('[DEBUG] 检测到加号按钮点击');
         addBotToEmptySeat();
       } else if (e.target.classList.contains('seat-remove-bot')) {
+        console.log('[DEBUG] 检测到删除按钮点击');
         const seat = e.target.closest('.seat');
         const botId = seat.dataset.botId;
         if (botId) removeBotById(botId);
@@ -310,8 +314,8 @@
           <div class="seat-status"></div>
           <div class="seat-cards"></div>
           <div class="seat-timer hidden"></div>
-          <button class="seat-add-bot hidden" title="添加机器人">+</button>
-          <button class="seat-remove-bot hidden" title="移除机器人">×</button>
+          <button class="seat-add-bot" title="添加机器人">+</button>
+          <button class="seat-remove-bot" title="移除机器人">×</button>
         </div>
         <div class="seat-bet hidden"></div>
       `;
@@ -606,13 +610,18 @@ function restartGame() {
 
   // ===== 机器人管理 =====
   function addBotToEmptySeat() {
+    console.log('[DEBUG] addBotToEmptySeat 调用', { socket: !!socket, myRoomId });
+    
     if (!socket || !myRoomId) {
       showMessage('请先加入房间', 'error');
+      console.error('[DEBUG] socket或roomId未初始化');
       return;
     }
     
+    console.log('[DEBUG] 发送 addBot 事件');
     // 默认添加困难机器人
     socket.emit('addBot', { difficulty: 'hard' }, (response) => {
+      console.log('[DEBUG] addBot 响应:', response);
       if (response && response.success) {
         showMessage(`🤖 ${response.botName} 已加入`, 'success');
       } else {

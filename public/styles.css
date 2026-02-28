@@ -551,3 +551,29 @@ input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;hei
     font-size: 18px;
   }
 }
+
+/* 默认隐藏所有座位按钮 */
+.seat-add-bot,
+.seat-remove-bot {
+  display: none;
+}
+
+/* 只在空座位显示加号 */
+.seat.empty .seat-add-bot {
+  display: flex !important;
+}
+
+/* 只在机器人座位显示删除按钮 */
+.seat.bot .seat-remove-bot {
+  display: flex !important;
+}
+
+/* 非空座位隐藏加号 */
+.seat:not(.empty) .seat-add-bot {
+  display: none !important;
+}
+
+/* 非机器人座位隐藏删除按钮 */
+.seat:not(.bot) .seat-remove-bot {
+  display: none !important;
+}
