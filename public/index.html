@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0a0e14">
+  <title>德州扑克</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- 大厅 -->
+  <div id="lobby" class="screen active">
+    <div class="lobby-container">
+      <div class="logo">
+        <span class="logo-icon">🃏</span>
+        <h1>德州扑克</h1>
+        <p class="subtitle">在线多人 · 最多7人 · 20轮制</p>
+      </div>
+      <div class="lobby-form">
+        <div class="input-group">
+          <label for="playerName">你的昵称</label>
+          <input type="text" id="playerName" placeholder="输入昵称" maxlength="8" autocomplete="off">
+        </div>
+        <div class="lobby-buttons">
+          <button id="btnQuickJoin" class="btn btn-primary btn-large">⚡ 快速加入</button>
+          <button id="btnCreateRoom" class="btn btn-secondary">➕ 创建房间</button>
+          <div class="join-room-row">
+            <input type="text" id="roomIdInput" placeholder="房间号" maxlength="6" autocomplete="off">
+            <button id="btnJoinRoom" class="btn btn-secondary">加入</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 游戏 -->
+  <div id="gameScreen" class="screen">
+    <!-- 顶栏 -->
+    <div class="top-bar">
+      <div class="top-left">
+        <span id="roomIdDisplay" class="room-id"></span>
+        <button id="btnCopyRoom" class="btn-icon-small" title="复制">📋</button>
+      </div>
+      <div class="top-center">
+        <span id="roundDisplay" class="round-display"></span>
+      </div>
+      <div class="top-right">
+        <span id="playerCountDisplay">0/7</span>
+        <button id="btnLeave" class="btn btn-danger btn-small">离开</button>
+      </div>
+    </div>
+
+    <!-- 牌桌 -->
+    <div class="table-container">
+      <div class="poker-table">
+        <div id="seats"></div>
+        <div class="community-area">
+          <div id="communityCards" class="community-cards"></div>
+          <div id="potDisplay" class="pot-display">底池: 0</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 操作区 -->
+    <div id="actionBar" class="action-bar hidden">
+      <div class="timer-bar" id="timerBar">
+        <div class="timer-fill" id="timerFill"></div>
+        <span class="timer-text" id="timerText">2:00</span>
+      </div>
+      <div class="action-buttons">
+        <button id="btnFold" class="btn btn-action btn-fold">弃牌</button>
+        <button id="btnCheck" class="btn btn-action btn-check">过牌</button>
+        <button id="btnCall" class="btn btn-action btn-call">跟注</button>
+        <button id="btnRaise" class="btn btn-action btn-raise">加注</button>
+        <button id="btnAllIn" class="btn btn-action btn-allin">全下</button>
+      </div>
+      <div class="raise-controls hidden" id="raiseControls">
+        <input type="range" id="raiseSlider" min="0" max="1000" value="0" title="加注金额">
+        <div class="raise-amount-row">
+          <input type="number" id="raiseAmount" min="0" value="0" title="加注金额">
+          <button id="btnConfirmRaise" class="btn btn-primary btn-small">确认</button>
+        </div>
+        <div class="raise-presets">
+          <button class="btn btn-preset" data-multiplier="0.5">½底池</button>
+          <button class="btn btn-preset" data-multiplier="0.75">¾底池</button>
+          <button class="btn btn-preset" data-multiplier="1">满池</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 等待/准备区 -->
+    <div id="readyBar" class="ready-bar">
+      <button id="btnReady" class="btn btn-primary btn-large">准备</button>
+      <button id="btnRebuy" class="btn btn-secondary btn-large hidden">💰 重购 1000</button>
+      <div class="bot-controls">
+        <button id="btnAddBotEasy" class="btn btn-bot btn-small" title="添加简单机器人">🤖 简单</button>
+        <button id="btnAddBotMedium" class="btn btn-bot btn-small" title="添加中等机器人">🤖 中等</button>
+        <button id="btnAddBotHard" class="btn btn-bot btn-small" title="添加困难机器人">🤖 困难</button>
+        <button id="btnRemoveAllBots" class="btn btn-danger btn-small hidden">移除机器人</button>
+      </div>
+    </div>
+
+    <!-- SHOWDOWN 确认区 -->
+    <div id="showdownBar" class="showdown-bar hidden">
+      <div class="showdown-info">
+        <span id="confirmStatus" class="confirm-status"></span>
+      </div>
+      <div class="showdown-actions">
+        <button id="btnConfirmNext" class="btn btn-primary btn-large">✅ 确认下一局</button>
+        <button id="btnRebuyShowdown" class="btn btn-secondary btn-large hidden">💰 重购 1000</button>
+      </div>
+    </div>
+
+    <!-- 消息（可拖拽） -->
+    <div id="messageLog" class="message-log">
+      <div class="drag-handle">💬 消息 <span class="drag-hint">可拖动</span></div>
+      <div id="messages" class="messages"></div>
+      <div class="chat-input-row">
+        <input type="text" id="chatInput" placeholder="消息..." maxlength="60">
+        <button id="btnSendChat" class="btn btn-small">发送</button>
+      </div>
+    </div>
+
+    <!-- 结算弹窗（仅20轮结束时） -->
+    <div id="settlementOverlay" class="settlement-overlay hidden">
+      <div class="settlement-content">
+        <h2>🏁 比赛结算</h2>
+        <p class="settlement-sub">20轮比赛结束</p>
+        <div id="settlementList" class="settlement-list"></div>
+        <button id="btnRestart" class="btn btn-primary btn-large">🔄 再来一场</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
