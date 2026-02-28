@@ -67,10 +67,6 @@
     $('#btnRebuyShowdown').addEventListener('click', doRebuy);
     $('#btnConfirmNext').addEventListener('click', doConfirmNext);
     $('#btnRestart').addEventListener('click', doRestart);
-    $('#btnAddBotEasy').addEventListener('click', () => addBot('easy'));
-    $('#btnAddBotMedium').addEventListener('click', () => addBot('medium'));
-    $('#btnAddBotHard').addEventListener('click', () => addBot('hard'));
-    $('#btnRemoveAllBots').addEventListener('click', removeAllBots);
 
     chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
     playerNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') quickJoin(); });
@@ -91,6 +87,17 @@
 
     generateSeats();
     initDraggableChat();
+    
+    // 座位按钮事件委托
+    seatsContainer.addEventListener('click', (e) => {
+      if (e.target.classList.contains('seat-add-bot')) {
+        addBotToEmptySeat();
+      } else if (e.target.classList.contains('seat-remove-bot')) {
+        const seat = e.target.closest('.seat');
+        const botId = seat.dataset.botId;
+        if (botId) removeBotById(botId);
+      }
+    });
 
     // 页面加载时自动重连
     const savedRoom = localStorage.getItem('pokerRoom');
@@ -303,6 +310,8 @@
           <div class="seat-status"></div>
           <div class="seat-cards"></div>
           <div class="seat-timer hidden"></div>
+          <button class="seat-add-bot hidden" title="添加机器人">+</button>
+          <button class="seat-remove-bot hidden" title="移除机器人">×</button>
         </div>
         <div class="seat-bet hidden"></div>
       `;
@@ -345,6 +354,13 @@
       if (p.status === 'active') el.classList.add('active');
       if (p.id === st.currentPlayerId && isPlaying && st.phase !== 'showdown') {
         el.classList.add('current-turn');
+      }
+      
+      // 检测机器人
+      const isBot = p.name.startsWith('Bot简单') || p.name.startsWith('Bot中等') || p.name.startsWith('Bot困难');
+      if (isBot) {
+        el.classList.add('bot');
+        el.dataset.botId = p.id;
       }
 
       el.querySelector('.seat-name').textContent = p.name;
@@ -589,31 +605,28 @@ function restartGame() {
 })();
 
   // ===== 机器人管理 =====
-  function addBot(difficulty) {
+  function addBotToEmptySeat() {
     if (!socket || !myRoomId) {
       showMessage('请先加入房间', 'error');
       return;
     }
     
-    socket.emit('addBot', { difficulty }, (response) => {
+    // 默认添加困难机器人
+    socket.emit('addBot', { difficulty: 'hard' }, (response) => {
       if (response && response.success) {
         showMessage(`🤖 ${response.botName} 已加入`, 'success');
-        $('#btnRemoveAllBots').classList.remove('hidden');
       } else {
         showMessage(response?.message || '添加机器人失败', 'error');
       }
     });
   }
   
-  function removeAllBots() {
+  function removeBotById(botId) {
     if (!socket || !myRoomId) return;
     
-    socket.emit('removeAllBots', (response) => {
+    socket.emit('removeBot', { botId }, (response) => {
       if (response && response.success) {
-        if (response.count > 0) {
-          showMessage('🤖 已移除所有机器人', 'info');
-        }
-        $('#btnRemoveAllBots').classList.add('hidden');
+        showMessage('🤖 机器人已移除', 'info');
       } else {
         showMessage(response?.message || '移除失败', 'error');
       }

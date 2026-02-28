@@ -374,27 +374,42 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 移除所有机器人
-  socket.on('removeAllBots', (callback) => {
+  // 移除单个机器人
+  socket.on('removeBot', (data, callback) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) {
       if (typeof callback === 'function') callback({ success: false, message: '你不在任何房间' });
       return;
     }
+    const game = rooms.get(roomId);
     const botManager = botManagers.get(roomId);
-    if (!botManager) {
+    if (!game || !botManager) {
       if (typeof callback === 'function') callback({ success: false, message: '房间不存在' });
       return;
     }
 
-    const botIds = botManager.getBotIds();
-    botManager.removeAllBots();
-    
-    broadcastGameState(roomId);
-    if (botIds.length > 0) {
-      broadcastMessage(roomId, `🤖 所有机器人已移除`);
+    const { botId } = data;
+    if (!botId) {
+      if (typeof callback === 'function') callback({ success: false, message: '无效的机器人ID' });
+      return;
     }
-    if (typeof callback === 'function') callback({ success: true, count: botIds.length });
+
+    const bot = game.players.get(botId);
+    if (!bot) {
+      if (typeof callback === 'function') callback({ success: false, message: '机器人不存在' });
+      return;
+    }
+
+    const botName = bot.name;
+    const removed = botManager.removeBot(botId);
+    
+    if (removed) {
+      broadcastGameState(roomId);
+      broadcastMessage(roomId, `🤖 ${botName} 已离开`);
+      if (typeof callback === 'function') callback({ success: true });
+    } else {
+      if (typeof callback === 'function') callback({ success: false, message: '移除失败' });
+    }
   });
 
   // 准备（首轮需要准备，后续全员确认续局）
