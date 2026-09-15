@@ -1,72 +1,42 @@
-# 🃏 德州扑克 - 在线多人对战
+# Texas Hold’em
 
-一个支持最多 **7 人** 同时在线游玩的德州扑克游戏。
+[简体中文](README.zh-CN.md)
 
-## 功能特性
+**A browser-based multiplayer poker experiment for up to seven players.**
 
-- 支持 2-7 人同时在线游戏
-- 实时 WebSocket 通信
-- 房间系统（创建/加入/快速匹配）
-- 完整的德州扑克规则
-  - 盲注系统
-  - 四轮下注（翻牌前、翻牌、转牌、河牌）
-  - 手牌评估与比较
-  - 弃牌 / 过牌 / 跟注 / 加注 / 全下
-- 游戏内聊天
-- 自动补充筹码
+Create a room, invite friends with its room code, or add bots to explore the game locally. Built for learning and casual play with virtual chips; no real-money payments are included.
 
-## 快速开始
+**Stage:** runnable web-game prototype. Room handling, betting actions, hand evaluation, chat and bots exist in the source. The full multiplayer experience, poker edge cases and production reliability are not comprehensively verified.
 
-### 1. 安装依赖
+## Run locally
+
+Requires Node.js 18+ and npm.
 
 ```bash
+git clone https://github.com/wangyuqin378-cpu/texas-holdem.git
 cd texas-holdem
 npm install
-```
-
-### 2. 启动服务器
-
-```bash
 npm start
 ```
 
-### 3. 打开浏览器
+Open [localhost:3000](http://localhost:3000), create a room and add a bot or join from a second browser session. The server listens on all network interfaces; friends on the same network can use your computer's LAN address and the same port. Use `PORT=3001 npm start` if port 3000 is occupied.
 
-访问 `http://localhost:3000`
+## What is implemented
 
-### 4. 邀请好友
+- Room creation, room-code joining and quick join.
+- Up to seven players, including optional bots.
+- Blinds, four betting rounds, hand evaluation and common betting actions.
+- Room chat and virtual-chip rebuys.
 
-- 分享房间号给好友，让他们输入房间号加入
-- 或者在同一局域网内访问你的 IP 地址 + 端口号（如 `http://192.168.x.x:3000`）
+The starting settings and game rules are described in the [Chinese guide](README.zh-CN.md#游戏规则). This is a prototype, not a certified rules engine or production gambling service.
 
-## 游戏规则
+## Project layout
 
-1. 每位玩家初始获得 **1000** 筹码
-2. 小盲注 **10**，大盲注 **20**
-3. 每位玩家发 2 张手牌（底牌）
-4. 公共牌分三轮发出：翻牌（3张）、转牌（1张）、河牌（1张）
-5. 用手中 2 张底牌 + 5 张公共牌中选出最佳 5 张组合
-6. 牌型大小：皇家同花顺 > 同花顺 > 四条 > 葫芦 > 同花 > 顺子 > 三条 > 两对 > 一对 > 高牌
+- `server/index.js`: HTTP server and Socket.IO room events.
+- `server/game.js`, `server/deck.js`, `server/handEvaluator.js`: game logic.
+- `server/botManager.js`: bot behavior.
+- `public/`: browser interface.
 
-## 技术栈
+## License
 
-- **后端**: Node.js + Express + Socket.IO
-- **前端**: 原生 HTML/CSS/JS
-- **通信**: WebSocket (Socket.IO)
-
-## 项目结构
-
-```
-texas-holdem/
-├── server/
-│   ├── index.js          # 服务器入口 + WebSocket 事件处理
-│   ├── game.js           # 游戏核心逻辑
-│   ├── deck.js           # 扑克牌和牌组
-│   └── handEvaluator.js  # 手牌评估器
-├── public/
-│   ├── index.html        # 游戏页面
-│   ├── styles.css        # 样式
-│   └── app.js            # 客户端逻辑
-├── package.json
-└── README.md
-```
+The source is publicly visible. No open-source license has been granted in this repository.
