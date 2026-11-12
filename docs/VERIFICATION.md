@@ -26,6 +26,7 @@
 - `npm run test:browser`：3 条端到端流程通过，含两浏览器完整 20 手。视口为 1440×960、390×844、375×812 和 844×390；零页面脚本异常。检查无横向溢出、牌面/控件不相互遮挡、7 个座位不重叠。
 - 截图人工检查发现并修复了最初 DOM 断言未捕获的遮挡；截图证据位于本目录的 `verification/`。
 - 本地浏览器为官方 Chromium 141 / Playwright 缓存 build 1193，通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 运行；CI 使用 Playwright 安装的对应 Chromium。
+- 2026-11-13 首次云端运行中规则、联机与依赖检查通过；浏览器安装因 `ubuntu-latest` 已升级到 Playwright 1.56.1 不支持的 Ubuntu 26.04 而失败。CI 已固定 Ubuntu 24.04；最终运行结果见 [PR #2 的检查记录](https://github.com/wangyuqin378-cpu/texas-holdem/pull/2/checks)。
 - `npm audit`：从 9 项（含高危及严重项）降为 0 项。仅使用相容更新、移除不再使用的 uuid，以及 qs 6.16.2 安全覆盖。
 
 [桌面比牌](verification/desktop-showdown.png) · [手机比牌](verification/mobile-showdown.png) · [手机总结](verification/mobile-summary.png) · [七人竖屏](verification/seven-seats-mobile.png) · [七人横屏](verification/seven-seats-landscape.png)
