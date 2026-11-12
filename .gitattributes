@@ -1,0 +1,2 @@
+# Preserve the exact pre-repair strategy snapshot used for reproducible comparisons.
+tests/fixtures/legacy-bot.cjs -whitespace

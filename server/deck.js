@@ -2,6 +2,7 @@
  * 扑克牌和牌组模块
  */
 
+const { randomInt } = require('node:crypto');
 const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'];
 const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
 
@@ -40,7 +41,8 @@ class Card {
 }
 
 class Deck {
-  constructor() {
+  constructor(random = null) {
+    this.random = random;
     this.cards = [];
     this.reset();
   }
@@ -58,7 +60,7 @@ class Deck {
   shuffle() {
     // Fisher-Yates 洗牌算法
     for (let i = this.cards.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = this.random ? Math.floor(this.random() * (i + 1)) : randomInt(i + 1);
       [this.cards[i], this.cards[j]] = [this.cards[j], this.cards[i]];
     }
   }
