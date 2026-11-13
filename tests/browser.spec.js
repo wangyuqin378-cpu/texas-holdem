@@ -64,3 +64,27 @@ test('seven-seat phone and landscape controls stay reachable; bot defaults and r
   await page.locator('#btnFold').click();await expect(page.locator('#handResults')).toBeVisible({timeout:20000});await expect(page.locator('#btnConfirmNext')).toBeVisible();expect(errors).toEqual([]);
  }finally{await context.close();}
 });
+
+test('refresh at showdown enables confirmation even when state arrives before rejoin acknowledgement',async({browser})=>{
+ const delayRejoinAck=socket=>socket.use((packet,next)=>{
+  if(packet[0]==='rejoinRoom'){
+   const acknowledge=packet[packet.length-1];
+   packet[packet.length-1]=(...args)=>setTimeout(()=>acknowledge(...args),75);
+  }
+  next();
+ });
+ runtime.io.on('connection',delayRejoinAck);
+ const contexts=await Promise.all([0,1].map(()=>browser.newContext())),pages=await Promise.all(contexts.map(c=>c.newPage()));
+ try{
+  const room=await create(pages[0],'刷新验收');await join(pages[1],room,'等待确认');
+  for(const page of pages)await page.locator('#btnReady').click();
+  await expect(pages[0].locator('#btnCall')).toBeVisible();await actHand(pages,room);
+  await pages[0].reload();await expect(pages[0].locator('#gameScreen')).toHaveClass(/active/);
+  await expect(pages[0].locator('#playerCountDisplay')).toHaveText('2/7');
+  await expect(pages[0].locator('#btnConfirmNext')).toBeEnabled();
+  await pages[0].locator('#btnConfirmNext').click();
+  await expect(pages[0].locator('#btnConfirmNext')).toHaveText('已确认，等待其他人');
+  await pages[1].locator('#btnConfirmNext').click();
+  await expect(pages[0].locator('#roundDisplay')).toHaveText('第 2/20 轮');
+ }finally{runtime.io.off('connection',delayRejoinAck);await Promise.all(contexts.map(c=>c.close()));}
+});

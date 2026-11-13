@@ -53,7 +53,8 @@
     myPlayerId = response.playerId; myRoomId = response.roomId; seated = true;
     storage.set('pokerSession', response.sessionToken); storage.set('pokerRoom', response.roomId);
     $('#lobby').classList.remove('active'); $('#gameScreen').classList.add('active');
-    $('#roomIdDisplay').textContent = `房间 ${myRoomId}`; $('#connectionStatus').textContent = '已连接'; updateDisabled();
+    $('#roomIdDisplay').textContent = `房间 ${myRoomId}`; $('#connectionStatus').textContent = '已连接';
+    if (currentState) render(currentState); else updateDisabled();
   }
   function connect() {
     if (socket) return;
