@@ -2,11 +2,12 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#0a0e14">
   <title>德州扑克</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -21,13 +22,14 @@
       <div class="lobby-form">
         <div class="input-group">
           <label for="playerName">你的昵称</label>
-          <input type="text" id="playerName" placeholder="输入昵称" maxlength="8" autocomplete="off">
+          <input type="text" id="playerName" placeholder="输入昵称" maxlength="16" autocomplete="off">
         </div>
-        <div class="lobby-buttons">
+        <p id="lobbyError" role="alert" class="error-text"></p>
+      <div class="lobby-buttons">
           <button id="btnQuickJoin" class="btn btn-primary btn-large">⚡ 快速加入</button>
           <button id="btnCreateRoom" class="btn btn-secondary">➕ 创建房间</button>
           <div class="join-room-row">
-            <input type="text" id="roomIdInput" placeholder="房间号" maxlength="6" autocomplete="off">
+            <input type="text" id="roomIdInput" aria-label="房间号" placeholder="房间号" maxlength="6" autocomplete="off">
             <button id="btnJoinRoom" class="btn btn-secondary">加入</button>
           </div>
         </div>
@@ -52,6 +54,13 @@
       </div>
     </div>
 
+    <p id="connectionStatus" class="connection-status" role="status" aria-live="polite"></p>
+    <div id="botControls" class="room-tools hidden">
+      <label>机器人难度 <select id="botDifficulty"><option value="easy">轻松</option><option value="medium" selected>标准</option><option value="hard">挑战</option></select></label>
+      <label>风格 <select id="botStyle"><option value="mixed">轮换风格</option><option value="steady">稳健</option><option value="balanced">均衡</option><option value="active">积极</option></select></label>
+      <button id="btnAddBot" class="btn btn-secondary btn-small">添加机器人</button>
+    </div>
+    <p id="tableStatus" class="table-status" role="status"></p>
     <!-- 牌桌 -->
     <div class="table-container">
       <div class="poker-table">
@@ -63,6 +72,7 @@
       </div>
     </div>
 
+    <section id="handResults" class="hand-results hidden" aria-label="本手比牌结果"></section>
     <!-- 操作区 -->
     <div id="actionBar" class="action-bar hidden">
       <div class="timer-bar" id="timerBar">
@@ -82,6 +92,7 @@
           <input type="number" id="raiseAmount" min="0" value="0" title="加注金额">
           <button id="btnConfirmRaise" class="btn btn-primary btn-small">确认</button>
         </div>
+        <p id="raiseSummary" class="raise-summary" aria-live="polite"></p>
         <div class="raise-presets">
           <button class="btn btn-preset" data-multiplier="0.5">½底池</button>
           <button class="btn btn-preset" data-multiplier="0.75">¾底池</button>
@@ -107,22 +118,26 @@
       </div>
     </div>
 
-    <!-- 消息（可拖拽） -->
-    <div id="messageLog" class="message-log">
-      <div class="drag-handle">💬 消息 <span class="drag-hint">可拖动</span></div>
+    <!-- 可折叠的记录，不遮挡牌桌 -->
+    <details id="messageLog" class="message-log">
+      <summary>💬 对局记录与聊天</summary>
       <div id="messages" class="messages"></div>
       <div class="chat-input-row">
-        <input type="text" id="chatInput" placeholder="消息..." maxlength="60">
+        <input type="text" id="chatInput" aria-label="聊天消息" placeholder="消息..." maxlength="60">
         <button id="btnSendChat" class="btn btn-small">发送</button>
       </div>
-    </div>
+    </details>
 
+    <button id="btnOpenSettlement" class="btn hidden">查看比赛总结</button>
     <!-- 结算弹窗（仅20轮结束时） -->
     <div id="settlementOverlay" class="settlement-overlay hidden">
-      <div class="settlement-content">
-        <h2>🏁 比赛结算</h2>
+      <div class="settlement-content" role="dialog" aria-modal="true" aria-labelledby="settlementTitle" tabindex="-1">
+        <h2 id="settlementTitle">🏁 比赛结算</h2>
         <p class="settlement-sub">20轮比赛结束</p>
         <div id="settlementList" class="settlement-list"></div>
+        <p id="settlementProgress" role="status"></p>
+        <button id="btnConfirmSettlement" class="btn btn-primary">确认总结</button>
+        <button id="btnViewLastHand" class="btn btn-secondary">查看最后一手牌</button>
         <button id="btnRestart" class="btn btn-primary btn-large">🔄 再来一场</button>
       </div>
     </div>

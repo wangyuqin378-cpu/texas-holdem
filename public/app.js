@@ -1,643 +1,283 @@
-/**
- * 德州扑克客户端 v5
- * - 自己永远在底部中间（视角旋转）
- * - SHOWDOWN 展示所有人牌型，全员确认后续局
- * - 聊天窗可拖拽
- * - 倒计时 / 重购 / 20轮结算
- * - 断线自动重连
- */
-(function () {
+(() => {
   'use strict';
-
-  let socket = null;
-  let myPlayerId = null;
-  let myRoomId = null;
-  let mySeatIndex = -1;
-  let currentState = null;
-  let timerInterval = null;
-  let isReconnecting = false;
-
-  const $ = (s) => document.querySelector(s);
-  const $$ = (s) => document.querySelectorAll(s);
-
-  const lobby = $('#lobby');
-  const gameScreen = $('#gameScreen');
-  const playerNameInput = $('#playerName');
-  const roomIdInput = $('#roomIdInput');
-  const roomIdDisplay = $('#roomIdDisplay');
-  const roundDisplay = $('#roundDisplay');
-  const playerCountDisplay = $('#playerCountDisplay');
-  const seatsContainer = $('#seats');
-  const communityCardsEl = $('#communityCards');
-  const potDisplay = $('#potDisplay');
-  const actionBar = $('#actionBar');
-  const readyBar = $('#readyBar');
-  const showdownBar = $('#showdownBar');
-  const raiseControls = $('#raiseControls');
-  const raiseSlider = $('#raiseSlider');
-  const raiseAmountInput = $('#raiseAmount');
-  const messagesEl = $('#messages');
-  const chatInput = $('#chatInput');
-  const timerFill = $('#timerFill');
-  const timerText = $('#timerText');
-  const settlementOverlay = $('#settlementOverlay');
-  const settlementList = $('#settlementList');
-  const btnRebuy = $('#btnRebuy');
-  const messageLog = $('#messageLog');
-
-  // ===== 初始化 =====
-  function init() {
-    const saved = localStorage.getItem('pokerName');
-    if (saved) playerNameInput.value = saved;
-
-    $('#btnQuickJoin').addEventListener('click', quickJoin);
-    $('#btnCreateRoom').addEventListener('click', createRoom);
-    $('#btnJoinRoom').addEventListener('click', joinRoom);
-    $('#btnLeave').addEventListener('click', leaveRoom);
-    $('#btnCopyRoom').addEventListener('click', copyRoomId);
-    $('#btnReady').addEventListener('click', toggleReady);
-    $('#btnFold').addEventListener('click', () => doAction('fold'));
-    $('#btnCheck').addEventListener('click', () => doAction('check'));
-    $('#btnCall').addEventListener('click', () => doAction('call'));
-    $('#btnRaise').addEventListener('click', showRaiseControls);
-    $('#btnAllIn').addEventListener('click', () => doAction('allin'));
-    $('#btnConfirmRaise').addEventListener('click', confirmRaise);
-    $('#btnSendChat').addEventListener('click', sendChat);
-    $('#btnRebuy').addEventListener('click', doRebuy);
-    $('#btnRebuyShowdown').addEventListener('click', doRebuy);
-    $('#btnConfirmNext').addEventListener('click', doConfirmNext);
-    $('#btnRestart').addEventListener('click', doRestart);
-
-    chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
-    playerNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') quickJoin(); });
-    roomIdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinRoom(); });
-    raiseSlider.addEventListener('input', () => { raiseAmountInput.value = raiseSlider.value; });
-    raiseAmountInput.addEventListener('input', () => { raiseSlider.value = raiseAmountInput.value; });
-
-    $$('.btn-preset').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const m = parseFloat(btn.dataset.multiplier);
-        if (currentState) {
-          const v = Math.max(Math.floor(currentState.pot * m), currentState.minRaise || 0);
-          raiseAmountInput.value = v;
-          raiseSlider.value = v;
-        }
-      });
-    });
-
-    generateSeats();
-    initDraggableChat();
-    
-    // 座位按钮事件委托
-    seatsContainer.addEventListener('click', (e) => {
-      console.log('[DEBUG] 座位点击:', e.target.className, e.target.tagName);
-      
-      if (e.target.classList.contains('seat-add-bot')) {
-        console.log('[DEBUG] 检测到加号按钮点击');
-        addBotToEmptySeat();
-      } else if (e.target.classList.contains('seat-remove-bot')) {
-        console.log('[DEBUG] 检测到删除按钮点击');
-        const seat = e.target.closest('.seat');
-        const botId = seat.dataset.botId;
-        if (botId) removeBotById(botId);
-      }
-    });
-
-    // 页面加载时自动重连
-    const savedRoom = localStorage.getItem('pokerRoom');
-    const savedName = localStorage.getItem('pokerName');
-    if (savedRoom && savedName) {
-      isReconnecting = true;
-      connectSocket();
-    }
-  }
-
-  // ===== 聊天窗拖拽 =====
-  function initDraggableChat() {
-    let dragging = false;
-    let startX, startY, origX, origY;
-
-    function onStart(e) {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
-      dragging = true;
-      const touch = e.touches ? e.touches[0] : e;
-      const rect = messageLog.getBoundingClientRect();
-      origX = rect.left;
-      origY = rect.top;
-      startX = touch.clientX;
-      startY = touch.clientY;
-      messageLog.style.transition = 'none';
-      e.preventDefault();
-    }
-
-    function onMove(e) {
-      if (!dragging) return;
-      const touch = e.touches ? e.touches[0] : e;
-      const dx = touch.clientX - startX;
-      const dy = touch.clientY - startY;
-      const newX = Math.max(0, Math.min(window.innerWidth - messageLog.offsetWidth, origX + dx));
-      const newY = Math.max(0, Math.min(window.innerHeight - messageLog.offsetHeight, origY + dy));
-      messageLog.style.left = newX + 'px';
-      messageLog.style.top = newY + 'px';
-      messageLog.style.bottom = 'auto';
-      messageLog.style.right = 'auto';
-      e.preventDefault();
-    }
-
-    function onEnd() {
-      dragging = false;
-      messageLog.style.transition = '';
-    }
-
-    messageLog.addEventListener('mousedown', onStart);
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onEnd);
-    messageLog.addEventListener('touchstart', onStart, { passive: false });
-    document.addEventListener('touchmove', onMove, { passive: false });
-    document.addEventListener('touchend', onEnd);
-  }
-
-  // ===== 连接 =====
-  function connectSocket() {
-    if (socket) {
-      // 如果已有连接且需要重连，直接发重连请求
-      if (isReconnecting && socket.connected) {
-        attemptRejoin();
-      }
-      return;
-    }
-    socket = io({
-      reconnection: true,
-      reconnectionAttempts: 50,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      timeout: 30000,
-    });
-
-    socket.on('connect', () => {
-      myPlayerId = socket.id;
-      // 如果之前在房间中，尝试重连
-      if (isReconnecting) {
-        attemptRejoin();
-      }
-    });
-
-    socket.on('gameState', (s) => {
-      currentState = s;
-      const me = s.players.find(p => p.id === myPlayerId);
-      if (me) mySeatIndex = me.seatIndex;
-      renderGameState(s);
-    });
-    socket.on('message', (m) => { addMessage(m.text, m.type); });
-    socket.on('chat', (d) => { addMessage(`${d.playerName}: ${d.message}`, 'chat'); });
-
-    socket.on('disconnect', () => {
-      // 不立即回大厅，标记重连中（Socket.IO 会自动重连 transport）
-      const savedRoom = localStorage.getItem('pokerRoom');
-      if (savedRoom && myRoomId) {
-        isReconnecting = true;
-        addMessage('连接断开，正在尝试重连...', 'warning');
-      } else {
-        showLobby();
-      }
-    });
-  }
-
-  // 尝试重新加入房间
-  function attemptRejoin() {
-    const savedRoom = localStorage.getItem('pokerRoom');
-    const savedName = localStorage.getItem('pokerName');
-    if (!savedRoom || !savedName) {
-      isReconnecting = false;
-      showLobby();
-      return;
-    }
-    addMessage('正在重连...', 'info');
-    socket.emit('rejoinRoom', { roomId: savedRoom, playerName: savedName }, (r) => {
-      isReconnecting = false;
-      if (r.success) {
-        myRoomId = r.roomId;
-        mySeatIndex = r.seatIndex;
-        showGame();
-        addMessage('重连成功！', 'success');
-      } else {
-        // 重连失败，清除保存的房间信息，回到大厅
-        addMessage('重连失败: ' + r.message, 'error');
-        localStorage.removeItem('pokerRoom');
-        showLobby();
-      }
-    });
-  }
-
-  // ===== 大厅 =====
-  function getName() {
-    const n = playerNameInput.value.trim();
-    if (!n) { playerNameInput.focus(); playerNameInput.style.borderColor = '#f56c6c'; setTimeout(() => { playerNameInput.style.borderColor = ''; }, 1500); return null; }
-    localStorage.setItem('pokerName', n);
-    return n;
-  }
-  function quickJoin() { const n = getName(); if (!n) return; connectSocket(); socket.emit('quickJoin', { playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; localStorage.setItem('pokerRoom', r.roomId); showGame(); } else alert(r.message); }); }
-  function createRoom() { const n = getName(); if (!n) return; connectSocket(); socket.emit('createRoom', { playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; localStorage.setItem('pokerRoom', r.roomId); showGame(); } else alert(r.message); }); }
-  function joinRoom() { const n = getName(); if (!n) return; const rid = roomIdInput.value.trim(); if (!rid) { roomIdInput.focus(); return; } connectSocket(); socket.emit('joinRoom', { roomId: rid, playerName: n }, (r) => { if (r.success) { myRoomId = r.roomId; localStorage.setItem('pokerRoom', r.roomId); showGame(); } else alert(r.message); }); }
-  function leaveRoom() { localStorage.removeItem('pokerRoom'); isReconnecting = false; if (socket) { socket.disconnect(); socket = null; } myRoomId = null; myPlayerId = null; mySeatIndex = -1; currentState = null; showLobby(); }
-  function copyRoomId() { if (!myRoomId) return; navigator.clipboard.writeText(myRoomId).then(() => { const b = $('#btnCopyRoom'); b.textContent = '✓'; setTimeout(() => { b.textContent = '📋'; }, 1200); }); }
-  function showLobby() { lobby.classList.add('active'); gameScreen.classList.remove('active'); messagesEl.innerHTML = ''; stopTimer(); }
-  function showGame() { lobby.classList.remove('active'); gameScreen.classList.add('active'); roomIdDisplay.textContent = myRoomId; }
-
-  // ===== 操作 =====
-  function toggleReady() { if (socket) socket.emit('ready', () => {}); }
-  function doAction(a) { if (!socket) return; socket.emit('action', { action: a }, (r) => { if (!r.success && r.message) addMessage(r.message, 'error'); }); raiseControls.classList.add('hidden'); }
-  function showRaiseControls() {
-    if (!currentState) return;
-    const me = currentState.players.find(p => p.id === myPlayerId); if (!me) return;
-    const max = me.chips - currentState.callAmount;
-    const min = currentState.minRaise || 20;
-    raiseSlider.min = min; raiseSlider.max = max; raiseSlider.value = min;
-    raiseAmountInput.min = min; raiseAmountInput.max = max; raiseAmountInput.value = min;
-    raiseControls.classList.remove('hidden');
-  }
-  function confirmRaise() { const a = parseInt(raiseAmountInput.value, 10); if (isNaN(a) || a <= 0) return; socket.emit('action', { action: 'raise', amount: a }, (r) => { if (!r.success && r.message) addMessage(r.message, 'error'); }); raiseControls.classList.add('hidden'); }
-  function doRebuy() { if (socket) socket.emit('rebuy', (r) => { if (!r.success) addMessage(r.message || '重购失败', 'error'); }); }
-  function doConfirmNext() {
-    if (!socket) return;
-    const btn = $('#btnConfirmNext');
-    btn.disabled = true;
-    btn.textContent = '⏳ 已确认，等待其他人...';
-    btn.classList.remove('btn-primary');
-    btn.classList.add('btn-secondary');
-    socket.emit('confirmNext', (r) => {
-      if (!r.success) {
-        addMessage(r.message || '确认失败', 'error');
-        btn.disabled = false;
-        btn.textContent = '✅ 确认下一局';
-        btn.classList.add('btn-primary');
-        btn.classList.remove('btn-secondary');
-      }
-    });
-  }
-  function doRestart() { if (socket) socket.emit('restart', () => {}); settlementOverlay.classList.add('hidden'); }
-  function sendChat() { const m = chatInput.value.trim(); if (!m || !socket) return; socket.emit('chat', { message: m }); chatInput.value = ''; }
-
-  // ===== 倒计时 =====
-  function startTimer(remaining, total) {
-    stopTimer();
-    let left = remaining;
-    updateTimerUI(left, total);
-    timerInterval = setInterval(() => { left--; if (left < 0) left = 0; updateTimerUI(left, total); }, 1000);
-  }
-  function stopTimer() { if (timerInterval) { clearInterval(timerInterval); timerInterval = null; } }
-  function updateTimerUI(left, total) {
-    const pct = (left / total) * 100;
-    timerFill.style.width = pct + '%';
-    timerFill.classList.toggle('urgent', left <= 15);
-    timerText.textContent = `${Math.floor(left / 60)}:${(left % 60).toString().padStart(2, '0')}`;
-  }
-
-  // ===== 视角旋转 =====
-  function toVisualSeat(serverSeatIndex) {
-    if (mySeatIndex < 0) return serverSeatIndex;
-    return (serverSeatIndex - mySeatIndex + 7) % 7;
-  }
-
-  // ===== 渲染 =====
-  function generateSeats() {
-    seatsContainer.innerHTML = '';
-    for (let i = 0; i < 7; i++) {
-      const el = document.createElement('div');
-      el.className = 'seat empty';
-      el.dataset.seat = i;
-      el.innerHTML = `
-        <div class="seat-inner">
-          <div class="seat-role hidden"></div>
-          <div class="seat-name">空位</div>
-          <div class="seat-chips"></div>
-          <div class="seat-status"></div>
-          <div class="seat-cards"></div>
-          <div class="seat-timer hidden"></div>
-          <button class="seat-add-bot" title="添加机器人">+</button>
-          <button class="seat-remove-bot" title="移除机器人">×</button>
-        </div>
-        <div class="seat-bet hidden"></div>
-      `;
-      seatsContainer.appendChild(el);
-    }
-  }
-
-  function renderGameState(st) {
-    if (!st) return;
-
-    playerCountDisplay.textContent = `${st.playerCount}/${st.maxPlayers}`;
-    roundDisplay.textContent = st.isGameStarted ? `第${st.currentRound}/${st.maxRounds}轮` : '等待开始';
-
-    // 重置座位
-    const seats = $$('.seat');
-    seats.forEach(el => {
-      el.className = 'seat empty';
-      el.querySelector('.seat-name').textContent = '空位';
-      el.querySelector('.seat-chips').textContent = '';
-      el.querySelector('.seat-status').textContent = '';
-      el.querySelector('.seat-status').className = 'seat-status';
-      el.querySelector('.seat-cards').innerHTML = '';
-      el.querySelector('.seat-bet').classList.add('hidden');
-      const r = el.querySelector('.seat-role');
-      r.className = 'seat-role hidden'; r.textContent = '';
-      el.querySelector('.seat-timer').classList.add('hidden');
-    });
-
-    const isPlaying = st.phase !== 'waiting' && st.phase !== 'settled';
-
-    // 渲染玩家（使用视角旋转）
-    for (const p of st.players) {
-      const vSeat = toVisualSeat(p.seatIndex);
-      const el = $(`.seat[data-seat="${vSeat}"]`);
-      if (!el) continue;
-
-      el.classList.remove('empty');
-      if (p.id === myPlayerId) el.classList.add('self');
-      if (p.status === 'folded') el.classList.add('folded');
-      if (p.status === 'active') el.classList.add('active');
-      if (p.id === st.currentPlayerId && isPlaying && st.phase !== 'showdown') {
-        el.classList.add('current-turn');
-      }
-      
-      // 检测机器人
-      const isBot = p.name.startsWith('Bot简单') || p.name.startsWith('Bot中等') || p.name.startsWith('Bot困难');
-      if (isBot) {
-        el.classList.add('bot');
-        el.dataset.botId = p.id;
-      }
-
-      el.querySelector('.seat-name').textContent = p.name;
-      el.querySelector('.seat-chips').textContent = `💰${p.chips}`;
-
-      // 断线状态
-      if (!p.isConnected) {
-        el.classList.add('disconnected');
-      }
-
-      // 位置标签 D / SB / BB
-      const roleEl = el.querySelector('.seat-role');
-      if (isPlaying || st.phase === 'showdown') {
-        if (p.seatIndex === st.dealerSeat) { roleEl.textContent = 'D'; roleEl.className = 'seat-role dealer'; }
-        else if (p.seatIndex === st.sbSeat) { roleEl.textContent = 'SB'; roleEl.className = 'seat-role sb'; }
-        else if (p.seatIndex === st.bbSeat) { roleEl.textContent = 'BB'; roleEl.className = 'seat-role bb'; }
-      }
-
-      // 状态
-      const statusEl = el.querySelector('.seat-status');
-      if (st.phase === 'waiting') {
-        statusEl.textContent = p.isReady ? '已准备' : '未准备';
-        if (p.isReady) statusEl.classList.add('ready');
-      } else if (st.phase === 'showdown' && st.lastResults) {
-        // SHOWDOWN：显示牌型、赢家、确认状态
-        const pResult = st.lastResults.find(r => r.playerId === p.id);
-        if (pResult) {
-          if (pResult.winAmount > 0) {
-            statusEl.textContent = `🏆 +${pResult.winAmount} ${pResult.handName || ''}`;
-            statusEl.classList.add('winner');
-            el.classList.add('winner');
-          } else if (p.status === 'folded') {
-            statusEl.textContent = '弃牌';
-          } else {
-            statusEl.textContent = pResult.handName || '';
-          }
-        }
-        // 已确认的玩家打勾
-        if (p.confirmedNext) {
-          el.classList.add('confirmed');
-        }
-      } else if (st.phase !== 'settled') {
-        if (p.status === 'folded') statusEl.textContent = '弃牌';
-        else if (p.status === 'all_in') statusEl.textContent = '全下';
-      }
-
-      // 手牌
-      const cardsEl = el.querySelector('.seat-cards');
-      cardsEl.innerHTML = '';
-      if (p.holeCards && p.holeCards.length > 0) {
-        for (const c of p.holeCards) cardsEl.appendChild(createCard(c, false));
-      }
-
-      // 下注
-      const betEl = el.querySelector('.seat-bet');
-      if (p.currentBet > 0) { betEl.textContent = p.currentBet; betEl.classList.remove('hidden'); }
-      else betEl.classList.add('hidden');
-
-      // 座位倒计时
-      const timerEl = el.querySelector('.seat-timer');
-      if (p.id === st.currentPlayerId && isPlaying && st.phase !== 'showdown') {
-        const rem = st.turnTimeRemaining || 0;
-        timerEl.textContent = rem > 60 ? `${Math.floor(rem / 60)}m` : rem;
-        timerEl.classList.remove('hidden');
-        timerEl.classList.toggle('urgent', rem <= 15);
-      }
-    }
-
-    // 公共牌
-    communityCardsEl.innerHTML = '';
-    if (st.communityCards && st.communityCards.length > 0) {
-      for (const c of st.communityCards) communityCardsEl.appendChild(createCard(c, true));
-    }
-
-    potDisplay.textContent = `底池: ${st.pot}`;
-
-    // 操作栏
-    const isMyTurn = st.currentPlayerId === myPlayerId && isPlaying && st.phase !== 'showdown';
-    if (isMyTurn && st.availableActions.length > 0) {
-      actionBar.classList.remove('hidden');
-      readyBar.classList.add('hidden');
-      showdownBar.classList.add('hidden');
-      $('#btnFold').classList.toggle('hidden', !st.availableActions.includes('fold'));
-      $('#btnCheck').classList.toggle('hidden', !st.availableActions.includes('check'));
-      $('#btnCall').classList.toggle('hidden', !st.availableActions.includes('call'));
-      $('#btnRaise').classList.toggle('hidden', !st.availableActions.includes('raise'));
-      $('#btnAllIn').classList.toggle('hidden', !st.availableActions.includes('allin'));
-      $('#btnCall').textContent = st.callAmount > 0 ? `跟注${st.callAmount}` : '跟注';
-      startTimer(st.turnTimeRemaining || 120, st.turnTimeLimit || 120);
-    } else {
-      actionBar.classList.add('hidden');
-      raiseControls.classList.add('hidden');
-      if (!isMyTurn) stopTimer();
-    }
-
-    // SHOWDOWN 阶段 → 显示确认栏
-    if (st.phase === 'showdown') {
-      readyBar.classList.add('hidden');
-      showdownBar.classList.remove('hidden');
-
-      // 确认状态
-      const confirmStatusEl = $('#confirmStatus');
-      confirmStatusEl.textContent = `已确认: ${st.confirmedCount}/${st.totalPlayerCount}`;
-
-      // 自己是否已确认
-      const me = st.players.find(p => p.id === myPlayerId);
-      const myConfirmed = me && me.confirmedNext;
-      const btnConfirm = $('#btnConfirmNext');
-      if (myConfirmed) {
-        btnConfirm.disabled = true;
-        btnConfirm.textContent = '⏳ 已确认，等待其他人...';
-        btnConfirm.classList.remove('btn-primary');
-        btnConfirm.classList.add('btn-secondary');
-      } else {
-        btnConfirm.disabled = false;
-        btnConfirm.textContent = '✅ 确认下一局';
-        btnConfirm.classList.add('btn-primary');
-        btnConfirm.classList.remove('btn-secondary');
-      }
-
-      // 重购按钮
-      const btnRebuySD = $('#btnRebuyShowdown');
-      btnRebuySD.classList.toggle('hidden', !st.canRebuy);
-    } else {
-      showdownBar.classList.add('hidden');
-    }
-
-    // 准备栏（只在等待阶段显示）
-    if (st.phase === 'waiting') {
-      readyBar.classList.remove('hidden');
-      const me = st.players.find(p => p.id === myPlayerId);
-      const readyBtn = $('#btnReady');
-      if (me && me.isReady) {
-        readyBtn.textContent = '取消准备';
-        readyBtn.classList.remove('btn-primary'); readyBtn.classList.add('btn-secondary');
-      } else {
-        readyBtn.textContent = '准备';
-        readyBtn.classList.add('btn-primary'); readyBtn.classList.remove('btn-secondary');
-      }
-      btnRebuy.classList.toggle('hidden', !st.canRebuy);
-    } else if (st.phase !== 'showdown') {
-      readyBar.classList.add('hidden');
-    }
-
-    // 20轮结算弹窗
-    if (st.phase === 'settled' && st.settlement) {
-      showSettlement(st.settlement);
-    } else {
-      settlementOverlay.classList.add('hidden');
-    }
-  }
-
-  function createCard(card, large) {
-    const el = document.createElement('div');
-    if (!card) { el.className = `card face-down${large ? ' large' : ''}`; return el; }
-    el.className = `card face-up ${card.suit}${large ? ' large' : ''}`;
-    el.innerHTML = `<span class="card-rank">${card.rank}</span><span class="card-suit">${card.symbol}</span>`;
-    return el;
-  }
-
-  function showSettlement(settlement) {
-    settlementOverlay.classList.remove('hidden');
-    let html = '';
-    html += renderSettlementConfirm();
-    settlement.forEach((s, i) => {
-      const prefix = s.profit >= 0 ? '+' : '';
-      html += `<div class="settlement-row ${i === 0 ? 'top' : ''}">
-        <div class="settlement-rank">${i + 1}</div>
-        <div class="settlement-name">${s.name}</div>
-        <div>
-          <div class="settlement-profit ${s.profit >= 0 ? 'positive' : 'negative'}">${prefix}${s.profit}</div>
-          <div class="settlement-detail">买入${s.totalBuyIn} 剩余${s.finalChips}</div>
-        </div>
-      </div>`;
-    });
-    settlementList.innerHTML = html;
-  }
-
+  const $ = selector => document.querySelector(selector);
+  const $$ = selector => [...document.querySelectorAll(selector)];
+  const PHASES = { waiting: '等待准备', pre_flop: '翻牌前', flop: '翻牌', turn: '转牌', river: '河牌', showdown: '本手结果', settled: '比赛结束' };
+  const DIFFICULTIES = { easy: '轻松', medium: '标准', hard: '挑战' };
+  const STYLES = { steady: '稳健', balanced: '均衡', active: '积极' };
+  let socket = null, currentState = null, myPlayerId = null, myRoomId = null, busy = false, connecting = false;
+  let seated = false, timer = null, resultHand = null, dismissedSettlement = null, botStyleCounter = 0;
+  const storage = {
+    get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+    set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+    remove(key) { try { localStorage.removeItem(key); } catch {} },
+  };
+  const el = (tag, className = '', text = '') => { const node = document.createElement(tag); node.className = className; node.textContent = text; return node; };
+  const show = (id, visible) => $(id).classList.toggle('hidden', !visible);
+  const requestId = () => typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : [...crypto.getRandomValues(new Uint8Array(16))].map(n => n.toString(16).padStart(2, '0')).join('');
   function addMessage(text, type = 'info') {
-    const el = document.createElement('div');
-    el.className = `msg ${type}`;
-    el.textContent = text;
-    messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    while (messagesEl.children.length > 40) messagesEl.removeChild(messagesEl.firstChild);
+    $('#messages').append(el('div', `msg ${['info','success','error','warning','chat'].includes(type) ? type : 'info'}`, text));
+    while ($('#messages').children.length > 80) $('#messages').firstChild.remove();
+    $('#messages').scrollTop = $('#messages').scrollHeight;
   }
-
-// 渲染总结确认按钮
-function renderSettlementConfirm() {
-  const game = state;
-  if (game.phase !== 'settled') return '';
-  
-  const confirmedSet = game.confirmedSettlement || new Set();
-  const confirmed = confirmedSet.has(socket.id);
-  const confirmedCount = confirmedSet.size;
-  const totalPlayers = game.players.length;
-  const allConfirmed = confirmedCount === totalPlayers;
-  
-  let html = '<div class="settlement-confirm">';
-  
-  if (!confirmed) {
-    html += '<button class="btn-confirm" onclick="confirmSettlement()">✅ 确认总结</button>';
-    html += '<p class="hint">查看完排名后请点击确认</p>';
-  } else {
-    html += '<p class="confirmed-text">✅ 你已确认</p>';
+  function error(text) { if (seated) { addMessage(text, 'error'); $('#connectionStatus').textContent = text; } else $('#lobbyError').textContent = text; }
+  function updateDisabled() {
+    $$('.action-buttons button, #btnConfirmRaise, #btnReady, #btnAddBot, .seat-add-bot, .seat-remove-bot, #btnRebuy, #btnRebuyShowdown, #btnSendChat').forEach(b => { b.disabled = busy || !seated || !socket?.connected; });
+    $$('#btnCreateRoom, #btnJoinRoom, #btnQuickJoin').forEach(b => { b.disabled = connecting || busy; });
   }
-  
-  html += `<p class="progress">已确认: ${confirmedCount}/${totalPlayers}</p>`;
-  
-  if (allConfirmed) {
-    html += '<button class="btn-restart" onclick="restartGame()">🔄 开始新的比赛</button>';
-  } else {
-    html += '<p class="waiting">等待其他玩家确认...</p>';
-  }
-  
-  html += '</div>';
-  return html;
-}
-
-// 确认总结
-function confirmSettlement() {
-  socket.emit('confirmSettlement', (response) => {
-    if (!response || !response.success) {
-      alert(response?.message || '确认失败');
-    }
-  });
-}
-
-// 重新开始游戏
-function restartGame() {
-  if (!confirm('确定要开始新的 20 轮比赛吗？')) {
-    return;
-  }
-  
-  socket.emit('restart', (response) => {
-    if (!response || !response.success) {
-      alert(response?.message || '无法重新开始，请稍后再试');
-    }
-  });
-}
-  // ===== 机器人管理 =====
-  function addBotToEmptySeat() {
-    console.log('[DEBUG] addBotToEmptySeat 调用', { socket: !!socket, myRoomId });
-
-    if (!socket || !myRoomId) {
-      addMessage('请先加入房间', 'error');
-      console.error('[DEBUG] socket或roomId未初始化');
-      return;
-    }
-
-    console.log('[DEBUG] 发送 addBot 事件');
-    // 默认添加困难机器人
-    socket.emit('addBot', { difficulty: 'hard' }, (response) => {
-      console.log('[DEBUG] addBot 响应:', response);
-      if (response && response.success) {
-        addMessage(`🤖 ${response.botName} 已加入`, 'success');
-      } else {
-        addMessage(response?.message || '添加机器人失败', 'error');
-      }
+  function request(event, data = {}) {
+    return new Promise(resolve => {
+      if (!socket?.connected) { resolve({ success: false, message: '连接尚未恢复，请稍后再试' }); return; }
+      const payload = { protocolVersion: 2, requestId: requestId(), ...data };
+      const send = attempt => socket.timeout(8000).emit(event, payload, (err, response) => {
+        if (err && attempt === 0 && socket?.connected) { send(1); return; }
+        resolve(err ? { success: false, retryable: true, message: '操作响应超时，请检查当前牌局再操作' } : response || { success: false, message: '没有收到操作结果' });
+      });
+      send(0);
     });
   }
-
-  function removeBotById(botId) {
-    if (!socket || !myRoomId) return;
-
-    socket.emit('removeBot', { botId }, (response) => {
-      if (response && response.success) {
-        addMessage('🤖 机器人已移除', 'info');
-      } else {
-        addMessage(response?.message || '移除失败', 'error');
+  async function act(event, data = {}) {
+    if (busy || !seated) return;
+    busy = true; updateDisabled();
+    const response = await request(event, data); busy = false;
+    if (!response.success) error(response.message || '操作失败');
+    if (currentState) render(currentState); else updateDisabled();
+    return response;
+  }
+  function clearSession() { storage.remove('pokerRoom'); storage.remove('pokerSession'); seated = false; myPlayerId = null; myRoomId = null; }
+  function lobby() {
+    currentState = null; resultHand = null; clearInterval(timer); $('#gameScreen').classList.remove('active'); $('#lobby').classList.add('active');
+    $('#messages').replaceChildren(); updateDisabled();
+  }
+  function enter(response) {
+    myPlayerId = response.playerId; myRoomId = response.roomId; seated = true;
+    storage.set('pokerSession', response.sessionToken); storage.set('pokerRoom', response.roomId);
+    $('#lobby').classList.remove('active'); $('#gameScreen').classList.add('active');
+    $('#roomIdDisplay').textContent = `房间 ${myRoomId}`; $('#connectionStatus').textContent = '已连接'; updateDisabled();
+  }
+  function connect() {
+    if (socket) return;
+    connecting = true; updateDisabled();
+    socket = io({ autoConnect: false, reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 1000, reconnectionDelayMax: 5000, timeout: 15000 });
+    socket.on('connect', async () => {
+      connecting = false;
+      const token = storage.get('pokerSession');
+      if (token) {
+        const result = await request('rejoinRoom', { sessionToken: token });
+        if (result.success) enter(result); else if (result.retryable) error(result.message); else { clearSession(); lobby(); error(result.message); }
+      }
+      updateDisabled();
+    });
+    socket.on('gameState', state => {
+      if (state.protocolVersion !== 2) { error('版本已更新，请刷新页面'); return; }
+      myPlayerId = state.youId; currentState = state;
+      render(state);
+    });
+    socket.on('message', msg => addMessage(msg.text, msg.type));
+    socket.on('chat', msg => addMessage(`${msg.playerName}: ${msg.message}`, 'chat'));
+    socket.on('disconnect', () => { seated = false; clearInterval(timer); $('#connectionStatus').textContent = '连接断开，正在重连。座位保留 5 分钟。'; updateDisabled(); });
+    socket.on('connect_error', () => { connecting = false; error('暂时无法连接服务器，正在重试…'); updateDisabled(); });
+    socket.on('sessionReplaced', () => { seated = false; myPlayerId = null; myRoomId = null; socket.disconnect(); socket = null; lobby(); error('此座位已在另一个页面恢复'); });
+    socket.connect();
+  }
+  async function join(event) {
+    const name = $('#playerName').value.trim(), room = $('#roomIdInput').value.trim();
+    if (!name) { error('请先输入昵称'); $('#playerName').focus(); return; }
+    if (event === 'joinRoom' && !/^[a-f0-9]{6}$/i.test(room)) { error('请输入六位房间号'); $('#roomIdInput').focus(); return; }
+    if (!socket) connect();
+    if (!socket.connected) { error('正在连接服务器，连接成功后即可加入'); return; }
+    if (busy) return; busy = true; updateDisabled(); $('#lobbyError').textContent = '';
+    const response = await request(event, { playerName: name, roomId: room });
+    busy = false;
+    if (response.success) { storage.set('pokerName', name); enter(response); } else error(response.message);
+    updateDisabled();
+  }
+  async function leave() {
+    if (busy) return;
+    if (socket?.connected && seated) { const result = await act('leaveRoom'); if (!result?.success) return; }
+    clearSession(); lobby();
+  }
+  function card(c, large = false) {
+    const node = el('div', `card ${c ? `face-up ${c.suit}` : 'face-down'}${large ? ' large' : ''}`);
+    node.setAttribute('aria-label', c ? `${c.rank}${c.symbol}` : '隐藏手牌');
+    if (c) node.append(el('span', 'card-rank', c.rank), el('span', 'card-suit', c.symbol));
+    return node;
+  }
+  function cardRow(cards, className = '', large = true) { const row = el('div', `cards-row ${className}`); cards.forEach(c => row.append(card(c, large))); return row; }
+  function buildSeats() {
+    for (let i = 0; i < 7; i++) {
+      const seat = el('div', 'seat empty'); seat.dataset.seat = i;
+      const inner = el('div', 'seat-inner');
+      for (const className of ['seat-role hidden', 'seat-name', 'seat-chips', 'seat-status', 'seat-cards', 'seat-timer hidden']) inner.append(el('div', className));
+      const add = el('button', 'seat-add-bot', '+'); add.title = '添加机器人'; add.setAttribute('aria-label', '添加机器人'); add.addEventListener('click', addBot);
+      const remove = el('button', 'seat-remove-bot', '×'); remove.title = '移除机器人'; remove.setAttribute('aria-label', '移除机器人'); remove.addEventListener('click', () => act('removeBot', { botId: seat.dataset.botId }));
+      inner.append(add, remove); seat.append(inner, el('div', 'seat-bet hidden')); $('#seats').append(seat);
+    }
+  }
+  async function addBot() {
+    const choice = $('#botStyle').value, style = choice === 'mixed' ? ['steady', 'balanced', 'active'][botStyleCounter % 3] : choice;
+    const result = await act('addBot', { difficulty: $('#botDifficulty').value, style }); if (result?.success) botStyleCounter++;
+  }
+  function render(state) {
+    const me = state.players.find(p => p.id === myPlayerId), host = state.hostPlayerId === myPlayerId;
+    const live = ['pre_flop', 'flop', 'turn', 'river'].includes(state.phase), between = ['waiting', 'showdown'].includes(state.phase);
+    $('#playerCountDisplay').textContent = `${state.playerCount}/${state.maxPlayers}`;
+    $('#roundDisplay').textContent = state.isGameStarted ? `第 ${state.currentRound}/${state.maxRounds} 轮` : '等待开始';
+    const current = state.players.find(p => p.id === state.currentPlayerId);
+    $('#tableStatus').textContent = `${PHASES[state.phase]}${current ? ` · ${current.id === myPlayerId ? '轮到你' : `等待 ${current.name}`}` : ''}${host ? ' · 你是房主' : ''}`;
+    show('#botControls', host && between);
+    for (const seat of $$('.seat')) {
+      seat.className = 'seat empty'; delete seat.dataset.botId;
+      for (const name of ['name', 'chips', 'status']) seat.querySelector(`.seat-${name}`).textContent = name === 'name' ? '空位' : '';
+      seat.querySelector('.seat-cards').replaceChildren();
+      seat.querySelector('.seat-role').className = 'seat-role hidden'; seat.querySelector('.seat-timer').classList.add('hidden'); seat.querySelector('.seat-bet').classList.add('hidden');
+      seat.querySelector('.seat-add-bot').classList.toggle('hidden', !host || !between);
+      seat.querySelector('.seat-remove-bot').classList.add('hidden');
+    }
+    for (const player of state.players) {
+      const visual = (player.seatIndex - (me?.seatIndex || 0) + 7) % 7, seat = $(`.seat[data-seat="${visual}"]`);
+      seat.classList.remove('empty');
+      for (const [name, yes] of [['self', player.id === myPlayerId], ['folded', player.status === 'folded'], ['bot', player.isBot], ['disconnected', !player.isConnected], ['current-turn', live && player.id === state.currentPlayerId]]) seat.classList.toggle(name, !!yes);
+      seat.querySelector('.seat-name').textContent = player.name;
+      seat.querySelector('.seat-name').title = player.isBot ? `${DIFFICULTIES[player.difficulty]} · ${STYLES[player.style]}` : player.name;
+      seat.querySelector('.seat-chips').textContent = `${player.chips} 筹码`;
+      const result = state.lastResults?.find(r => r.playerId === player.id);
+      seat.classList.toggle('winner', !!result?.winAmount);
+      seat.classList.toggle('confirmed', !!player.confirmedNext && state.phase === 'showdown');
+      seat.querySelector('.seat-status').textContent = result ? (result.winAmount ? `赢得 ${result.winAmount}` : result.handName) : state.phase === 'waiting' ? (player.isReady ? '已准备' : '未准备') : ({ folded: '弃牌', all_in: '全下', sitting_out: '等待下一手' }[player.status] || (player.isBot ? STYLES[player.style] : ''));
+      const roles = [];
+      if (player.seatIndex === state.dealerSeat) roles.push('D'); if (player.seatIndex === state.sbSeat) roles.push('SB'); if (player.seatIndex === state.bbSeat) roles.push('BB');
+      if (state.isGameStarted && roles.length) { const role = seat.querySelector('.seat-role'); role.textContent = roles.join(' / '); role.className = `seat-role ${roles.includes('D') ? 'dealer' : roles.includes('SB') ? 'sb' : 'bb'}`; }
+      player.holeCards.forEach(c => seat.querySelector('.seat-cards').append(card(c)));
+      if (live && player.currentBet > 0) { const bet = seat.querySelector('.seat-bet'); bet.textContent = player.currentBet; bet.classList.remove('hidden'); }
+      seat.querySelector('.seat-add-bot').classList.add('hidden');
+      if (player.isBot && host && between) { seat.dataset.botId = player.id; seat.querySelector('.seat-remove-bot').classList.remove('hidden'); }
+    }
+    $('#communityCards').replaceChildren(...state.communityCards.map(c => card(c, true)));
+    $('#potDisplay').textContent = `${state.potAwarded ? '本手总投入' : '底池'}: ${state.pot}`;
+    const myTurn = live && state.currentPlayerId === myPlayerId && seated && socket?.connected;
+    show('#actionBar', myTurn);
+    for (const [action, id] of Object.entries({ fold: 'Fold', check: 'Check', call: 'Call', raise: 'Raise', allin: 'AllIn' })) show(`#btn${id}`, myTurn && state.availableActions.includes(action));
+    $('#btnCall').textContent = `跟注 ${state.callAmount}`;
+    $('#btnRaise').textContent = state.currentBet === 0 ? '下注' : '加注';
+    if (!myTurn || $('#raiseControls').dataset.turn !== state.turnId) show('#raiseControls', false);
+    show('#readyBar', state.phase === 'waiting' || (state.phase === 'showdown' && !me?.isReady));
+    $('#btnReady').textContent = me?.isReady ? '取消准备' : state.phase === 'showdown' ? '下一手加入' : '准备';
+    show('#btnRebuy', state.canRebuy); show('#btnRebuyShowdown', state.canRebuy);
+    show('#showdownBar', state.phase === 'showdown');
+    $('#confirmStatus').textContent = `已确认 ${state.confirmedCount}/${state.totalPlayerCount} · 断线玩家不阻塞续局`;
+    $('#btnConfirmNext').textContent = me?.confirmedNext ? '已确认，等待其他人' : state.currentRound === state.maxRounds ? '确认并查看比赛总结' : '确认下一手';
+    $('#btnConfirmNext').disabled = busy || !seated || !!me?.confirmedNext;
+    renderResults(state); renderSettlement(state);
+    clearInterval(timer);
+    if (live && current) {
+      const deadline = Date.now() + state.turnTimeRemaining * 1000;
+      const tick = () => {
+        const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+        $('#timerFill').style.width = `${left / state.turnTimeLimit * 100}%`;
+        $('#timerText').textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+        const visual = (current.seatIndex - (me?.seatIndex || 0) + 7) % 7;
+        const badge = $(`.seat[data-seat="${visual}"] .seat-timer`); badge.textContent = left; badge.classList.remove('hidden'); badge.classList.toggle('urgent', left <= 15);
+      };
+      tick(); timer = setInterval(tick, 1000);
+    }
+    updateDisabled();
+  }
+  function renderResults(state) {
+    const visible = ['showdown', 'settled'].includes(state.phase) && state.lastResults;
+    show('#handResults', !!visible);
+    if (!visible) { resultHand = null; return; }
+    if (resultHand === state.handId) return;
+    resultHand = state.handId;
+    const area = $('#handResults'); area.replaceChildren(el('h2', '', `第 ${state.currentRound} 手 · ${state.isActualShowdown ? '比牌结果' : '其他玩家弃牌'}`));
+    if (state.isActualShowdown) area.append(el('p', 'result-label', '公共牌'), cardRow(state.communityCards, 'result-board'));
+    for (const r of state.lastResults) {
+      const row = el('article', `hand-result${r.winAmount ? ' result-winner' : ''}`);
+      row.append(el('h3', '', `${r.playerName} · ${r.handName}`), el('p', 'result-award', `赢得 ${r.winAmount} 筹码${r.returnedAmount ? ` · 未被跟注退回 ${r.returnedAmount}` : ''}`));
+      if (r.holeCards?.length) {
+        const own = el('div', 'result-group'); own.append(el('span', 'result-label', '底牌'), cardRow(r.holeCards, 'result-hole'));
+        const best = el('div', 'result-group'); best.append(el('span', 'result-label', '最佳五张'), cardRow(r.hand.cards, 'result-best'));
+        row.append(own, best);
+      }
+      area.append(row);
+    }
+    for (const [i, pot] of (state.sidePots || []).entries()) {
+      area.append(el('p', 'pot-result', `${i === 0 ? '主池' : `边池 ${i}`} ${pot.amount}：${pot.awards.map(a => `${state.lastResults.find(r => r.playerId === a.playerId)?.playerName || '玩家'} +${a.amount}`).join('，')}`));
+    }
+    area.append(el('p', 'result-label', state.isActualShowdown ? '参与比牌者全部亮牌；已弃牌玩家的底牌保持隐藏。' : '无需比牌，获胜者的底牌保持隐藏。'));
+  }
+  function renderSettlement(state) {
+    const settled = state.phase === 'settled', visible = settled && dismissedSettlement !== state.handId;
+    const wasVisible = !$('#settlementOverlay').classList.contains('hidden');
+    show('#settlementOverlay', visible); show('#btnOpenSettlement', settled && !visible);
+    if (!settled) { dismissedSettlement = null; return; }
+    $('#settlementList').replaceChildren(...state.settlement.map((p, i) => {
+      const row = el('div', `settlement-row${i === 0 ? ' top' : ''}`);
+      const detail = el('div'); detail.append(el('div', `settlement-profit ${p.profit >= 0 ? 'positive' : 'negative'}`, `${p.profit >= 0 ? '+' : ''}${p.profit}`), el('div', 'settlement-detail', `买入 ${p.totalBuyIn} · 剩余 ${p.finalChips}`));
+      row.append(el('div', 'settlement-rank', String(i + 1)), el('div', 'settlement-name', `${p.name}${p.departed ? '（已离开）' : ''}`), detail); return row;
+    }));
+    const connected = state.players.filter(p => p.isConnected), confirmed = connected.filter(p => p.confirmedSettlement).length;
+    $('#settlementProgress').textContent = `已确认 ${confirmed}/${connected.length}`;
+    const mine = state.confirmedSettlement.includes(myPlayerId);
+    $('#btnConfirmSettlement').disabled = busy || mine || !seated;
+    $('#btnConfirmSettlement').textContent = mine ? '已确认总结' : '确认总结';
+    show('#btnRestart', state.hostPlayerId === myPlayerId);
+    $('#btnRestart').disabled = busy || !seated || !state.allConfirmedSettlement;
+    if (visible && !wasVisible) $('.settlement-content').focus();
+  }
+  function updateRaise(value) {
+    if (!currentState) return;
+    const min = currentState.minRaiseTo, max = currentState.maxRaiseTo, target = Math.min(max, Math.max(min, Number(value) || min));
+    $('#raiseSlider').value = target; $('#raiseAmount').value = target;
+    const me = currentState.players.find(p => p.id === myPlayerId);
+    $('#raiseSummary').textContent = `本轮总下注 ${target} · 本次支付 ${target - me.currentBet}（含跟注）`;
+  }
+  function openRaise() {
+    if (!currentState?.availableActions.includes('raise')) return;
+    for (const id of ['#raiseSlider', '#raiseAmount']) { $(id).min = currentState.minRaiseTo; $(id).max = currentState.maxRaiseTo; $(id).step = 1; }
+    $('#raiseControls').dataset.turn = currentState.turnId;
+    updateRaise(currentState.minRaiseTo); show('#raiseControls', true); $('#raiseAmount').focus();
+  }
+  async function action(name, amount) {
+    if (!currentState) return;
+    await act('action', { action: name, amount, turnId: currentState.turnId, handId: currentState.handId }); show('#raiseControls', false);
+  }
+  function init() {
+    $('#playerName').value = storage.get('pokerName') || ''; buildSeats();
+    for (const [id, event] of [['#btnCreateRoom','createRoom'], ['#btnJoinRoom','joinRoom'], ['#btnQuickJoin','quickJoin']]) $(id).addEventListener('click', () => join(event));
+    $('#playerName').addEventListener('keydown', e => { if (e.key === 'Enter') join('quickJoin'); });
+    $('#roomIdInput').addEventListener('keydown', e => { if (e.key === 'Enter') join('joinRoom'); });
+    $('#btnLeave').addEventListener('click', leave);
+    $('#btnReady').addEventListener('click', () => act('ready', { ready: !currentState?.players.find(p => p.id === myPlayerId)?.isReady }));
+    for (const name of ['Fold','Check','Call','AllIn']) $(`#btn${name}`).addEventListener('click', () => action(name.toLowerCase()));
+    $('#btnRaise').addEventListener('click', openRaise);
+    $('#btnConfirmRaise').addEventListener('click', () => {
+      const target = Number($('#raiseAmount').value);
+      if (!Number.isSafeInteger(target) || target < currentState.minRaiseTo || target > currentState.maxRaiseTo) { error('请输入允许范围内的整数'); return; }
+      action('raise', target - currentState.currentBet);
+    });
+    $('#raiseSlider').addEventListener('input', e => updateRaise(e.target.value));
+    $('#raiseAmount').addEventListener('change', e => updateRaise(e.target.value));
+    $$('.btn-preset').forEach(btn => btn.addEventListener('click', () => updateRaise(currentState.currentBet + Math.round((currentState.pot + currentState.callAmount) * Number(btn.dataset.multiplier)))));
+    for (const id of ['#btnRebuy', '#btnRebuyShowdown']) $(id).addEventListener('click', () => act('rebuy'));
+    $('#btnConfirmNext').addEventListener('click', () => act('confirmNext', { handId: currentState.handId }));
+    $('#btnConfirmSettlement').addEventListener('click', () => act('confirmSettlement', { handId: currentState.handId }));
+    $('#btnRestart').addEventListener('click', () => act('restart'));
+    $('#btnViewLastHand').addEventListener('click', () => { dismissedSettlement = currentState.handId; renderSettlement(currentState); $('#btnOpenSettlement').focus(); $('#handResults').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    $('#btnOpenSettlement').addEventListener('click', () => { dismissedSettlement = null; renderSettlement(currentState); });
+    $('#settlementOverlay').addEventListener('keydown', e => {
+      if (e.key === 'Escape') $('#btnViewLastHand').click();
+      if (e.key === 'Tab') {
+        const buttons = [...$('.settlement-content').querySelectorAll('button:not(:disabled)')].filter(b => !b.classList.contains('hidden'));
+        if (e.shiftKey && (document.activeElement === buttons[0] || document.activeElement === $('.settlement-content'))) { e.preventDefault(); buttons.at(-1).focus(); }
+        else if (!e.shiftKey && document.activeElement === buttons.at(-1)) { e.preventDefault(); buttons[0].focus(); }
       }
     });
+    const chat = async () => { const message = $('#chatInput').value.trim(); if (message && (await act('chat', { message }))?.success) $('#chatInput').value = ''; };
+    $('#btnSendChat').addEventListener('click', chat); $('#chatInput').addEventListener('keydown', e => { if (e.key === 'Enter') chat(); });
+    $('#btnAddBot').addEventListener('click', addBot);
+    $('#btnCopyRoom').addEventListener('click', async () => { try { await navigator.clipboard.writeText(myRoomId); $('#connectionStatus').textContent = '房间号已复制'; } catch { $('#connectionStatus').textContent = `房间号：${myRoomId}，可手动复制`; } });
+    connect();
   }
-
   document.addEventListener('DOMContentLoaded', init);
 })();

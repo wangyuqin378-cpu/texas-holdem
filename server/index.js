@@ -1,711 +1,245 @@
-/**
- * 德州扑克在线服务器
- * - 20轮制 + 全员确认后续局
- * - 重购 + 结算
- * - 2分钟倒计时
- * - 断线重连支持
- */
-
 const express = require('express');
-const http = require('http');
+const http = require('node:http');
+const path = require('node:path');
+const { randomBytes, randomUUID, randomInt } = require('node:crypto');
 const { Server } = require('socket.io');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
-const { Game, GAME_PHASES } = require('./game');
+const { Game } = require('./game');
 const { BotManager } = require('./botManager');
+const { BotPool } = require('./botPool');
+const PROTOCOL_VERSION = 2;
+const failure = message => ({ success: false, message });
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
-  pingTimeout: 30000,      // 30秒无响应才判定断开（移动端切后台友好）
-  pingInterval: 10000,     // 每10秒 ping 一次
-});
-
-app.use(express.static(path.join(__dirname, '..', 'public')));
-
-const rooms = new Map();
-const botManagers = new Map();       // roomId → BotManager
-const playerRooms = new Map();       // socketId → roomId
-const roomTimers = new Map();
-const disconnectTimers = new Map();  // socketId → { timer, roomId, playerName }
-const DISCONNECT_TIMEOUT = 5 * 60 * 1000; // 5分钟断线保护
-
-function createRoom() {
-  const roomId = uuidv4().substring(0, 6).toUpperCase();
-  const game = new Game(roomId);
-  rooms.set(roomId, game);
-  // 创建机器人管理器
-  const botManager = new BotManager(io, game, roomId);
-  botManagers.set(roomId, botManager);
-  return roomId;
-}
-
-function broadcastGameState(roomId) {
-  const game = rooms.get(roomId);
-  if (!game) return;
-  for (const [playerId, player] of game.players) {
-    // 只给在线玩家发送状态
-    if (!player.isConnected) continue;
-    const state = game.getState(playerId);
-    io.to(playerId).emit('gameState', state);
+function createPokerServer(options = {}) {
+  const app = express(), server = http.createServer(app);
+  const io = new Server(server, { pingTimeout: 30000, pingInterval: 10000, maxHttpBufferSize: 16384 });
+  const rooms = new Map(), sessions = new Map(), pool = new BotPool(options.workers || 2);
+  const disconnectTimeout = options.disconnectTimeout ?? 300000, transitionDelay = options.transitionDelay ?? 800;
+  const createLimits = new Map(); let closed = false;
+  app.disable('x-powered-by');
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+    if (/\.(?:js|css)$/.test(req.path) || req.path === '/') res.setHeader('Cache-Control', 'no-cache');
+    next();
+  });
+  app.get('/healthz', (req, res) => res.json({ status: 'ok', protocolVersion: PROTOCOL_VERSION }));
+  app.use(express.static(path.join(__dirname, '..', 'public')));
+  const message = (room, text, type = 'info') => io.to(room.game.roomId).emit('message', { text, type, timestamp: Date.now() });
+  const humanOnline = room => [...room.game.players.values()].some(p => !p.isBot && p.isConnected && !p.departed);
+  function publish(room) {
+    for (const [id, token] of room.members) {
+      const session = sessions.get(token);
+      if (session?.socketId) io.to(session.socketId).emit('gameState', room.game.getState(id));
+    }
   }
-}
-
-function broadcastMessage(roomId, message, type = 'info') {
-  io.to(roomId).emit('message', { text: message, type, timestamp: Date.now() });
-}
-
-// 启动倒计时检测
-function startTurnTimer(roomId) {
-  clearTurnTimer(roomId);
-  const timer = setInterval(() => {
-    const game = rooms.get(roomId);
-    if (!game) { clearTurnTimer(roomId); return; }
-    // 非对局阶段直接停止计时器，而非空转
-    if (game.phase === GAME_PHASES.WAITING || game.phase === GAME_PHASES.SHOWDOWN || game.phase === GAME_PHASES.SETTLED) {
-      clearTurnTimer(roomId);
-      return;
+  function clearScheduled(room) { clearTimeout(room.turnTimer); clearTimeout(room.transitionTimer); room.turnTimer = null; room.turnKey = null; room.transitionTimer = null; room.transitionKey = null; room.botKey = null; }
+  function destroyRoom(room) {
+    clearScheduled(room);
+    for (const token of room.members.values()) { const s = sessions.get(token); clearTimeout(s?.expiryTimer); sessions.delete(token); }
+    rooms.delete(room.game.roomId); room.closed = true;
+  }
+  function createRoom() {
+    let id; do { id = randomBytes(3).toString('hex').toUpperCase(); } while (rooms.has(id));
+    const game = new Game(id);
+    const room = { game, members: new Map(), closed: false, observedHand: -1, observedIndex: 0, announcedShowdown: -1 };
+    room.bots = new BotManager(io, game, id, pool); rooms.set(id, room); return room;
+  }
+  function broadcastActions(room) {
+    if (room.observedHand !== room.game.handId) { room.observedHand = room.game.handId; room.observedIndex = 0; }
+    const labels = { fold: '弃牌', check: '过牌', call: '跟注', raise: '加注', allin: '全下' };
+    for (; room.observedIndex < room.game.roundHistory.length; room.observedIndex++) {
+      const event = room.game.roundHistory[room.observedIndex];
+      if (event.type === 'action') message(room, `${event.playerName} ${labels[event.action]}${event.amount ? ` ${event.amount}` : ''}${event.automatic ? '（断线托管）' : ''}`);
     }
-
-    const remaining = game.getTurnTimeRemaining();
-    // 只在关键时刻广播（每30秒一次、最后10秒每秒、超时）
-    if (remaining <= 10 || remaining % 30 === 0) {
-      broadcastGameState(roomId);
-    }
-    if (remaining <= 0) {
+    room.bots.observeActions();
+  }
+  function scheduleTransition(room, key, condition, run) {
+    if (room.transitionKey === key) return;
+    clearTimeout(room.transitionTimer); room.transitionKey = key;
+    room.transitionTimer = setTimeout(() => {
+      room.transitionKey = null; room.transitionTimer = null;
+      if (room.closed || !humanOnline(room) || !condition()) return;
+      run(); drive(room);
+    }, transitionDelay);
+    room.transitionTimer.unref();
+  }
+  function drive(room) {
+    if (room.closed || closed) return;
+    const game = room.game;
+    broadcastActions(room);
+    if (game.phase === 'showdown') {
+      room.bots.allBotsConfirmNext();
+      if (room.announcedShowdown !== game.handId) {
+        room.announcedShowdown = game.handId;
+        for (const r of game.lastResults || []) if (r.winAmount) message(room, `${r.playerName} 赢得 ${r.winAmount} · ${r.handName}`, 'success');
+      }
+    } else if (game.phase === 'settled') room.bots.allBotsConfirmSettlement();
+    publish(room);
+    if (!humanOnline(room)) { clearScheduled(room); return; }
+    if (game.isLive) {
+      clearTimeout(room.transitionTimer); room.transitionTimer = null; room.transitionKey = null;
+      const key = game.turnId;
+      if (room.turnKey !== key) {
+        clearTimeout(room.turnTimer); room.turnKey = key;
+        room.turnTimer = setTimeout(() => {
+          room.turnKey = null;
+          if (room.closed || game.turnId !== key) return;
+          const p = game.getCurrentPlayer(), result = game.handleTimeout();
+          if (result?.success) message(room, `${p.name} 超时，自动${result.action === 'check' ? '过牌' : '弃牌'}`);
+          drive(room);
+        }, Math.max(1, game.getTurnTimeRemaining()) * 1000);
+        room.turnTimer.unref();
+      }
       const player = game.getCurrentPlayer();
-      if (player) {
-        broadcastMessage(roomId, `⏰ ${player.name} 操作超时，自动弃牌`);
-        const result = game.handleTimeout();
-        if (result && result.success) {
-          handleActionResult(roomId, game, result, player, 'fold');
-        }
+      if (player?.isBot && room.botKey !== key) {
+        room.botKey = key;
+        const delay = options.botDelay ?? randomInt(650, 1151);
+        Promise.all([room.bots.decision(player.id).catch(() => null), new Promise(resolve => setTimeout(resolve, delay))]).then(([decision]) => {
+          if (room.closed || closed || game.turnId !== key || !humanOnline(room)) return;
+          let result = decision && game.playerAction(player.id, decision.action, decision.amount || 0, key);
+          if (!result?.success) result = game.playerAction(player.id, game.getAvailableActions(player.id).includes('check') ? 'check' : 'fold', 0, key);
+          room.botKey = null; drive(room);
+        }).catch(error => { console.error('Bot scheduling failed:', error.message); room.botKey = null; });
       }
+      return;
     }
-  }, 1000);
-  roomTimers.set(roomId, timer);
-}
-
-function clearTurnTimer(roomId) {
-  const timer = roomTimers.get(roomId);
-  if (timer) {
-    clearInterval(timer);
-    roomTimers.delete(roomId);
+    clearTimeout(room.turnTimer); room.turnTimer = null; room.turnKey = null; room.botKey = null;
+    if (game.phase === 'waiting' && game.canStartGame()) {
+      const hand = game.handId;
+      scheduleTransition(room, `start:${hand}`, () => game.handId === hand && game.canStartGame(), () => game.startGame());
+    } else if (game.phase === 'showdown' && game.allConfirmedNext) {
+      const hand = game.handId;
+      scheduleTransition(room, `next:${hand}`, () => game.handId === hand && game.allConfirmedNext, () => {
+        if (!game.prepareNextRound()) return;
+        room.bots.autoRebuyAll();
+        if (!game.startRound()) { game.phase = 'waiting'; message(room, '至少需要两名有筹码且已准备的玩家。可重购后准备。'); }
+      });
+    } else { clearTimeout(room.transitionTimer); room.transitionTimer = null; room.transitionKey = null; }
   }
-}
-
-// 广播本轮结果消息
-function broadcastRoundResults(roomId, game) {
-  const lastResults = game.lastResults;
-  if (lastResults) {
-    for (const r of lastResults) {
-      if (r.winAmount > 0) {
-        broadcastMessage(roomId, `🏆 ${r.playerName} +${r.winAmount}${r.handName ? ` (${r.handName})` : ''}`, 'success');
-      }
-    }
+  function attach(socket, room, session) {
+    clearTimeout(session.expiryTimer); session.expiryTimer = null;
+    const previous = session.socketId; session.socketId = socket.id;
+    socket.data.session = session; socket.join(room.game.roomId); room.game.reconnectPlayer(session.playerId);
+    if (previous && previous !== socket.id) { const old = io.sockets.sockets.get(previous); old?.emit('sessionReplaced'); old?.disconnect(true); }
+    return { success: true, protocolVersion: PROTOCOL_VERSION, roomId: room.game.roomId, playerId: session.playerId, sessionToken: session.token, seatIndex: room.game.players.get(session.playerId).seatIndex };
   }
-}
-
-// 进入 SHOWDOWN：广播结果，等待全员确认
-async function enterShowdown(roomId, game) {
-  clearTurnTimer(roomId);
-  broadcastRoundResults(roomId, game);
-  broadcastGameState(roomId);
-  broadcastMessage(roomId, '📋 请所有人查看结果后点击「确认下一局」');
-  
-  // 机器人自动确认
-  const botManager = botManagers.get(roomId);
-  if (botManager) {
-    await botManager.allBotsConfirmNext();
-    broadcastGameState(roomId);
-    
-    // 如果全员都确认了,开始下一轮
-    if (game.allConfirmedNext) {
-      broadcastMessage(roomId, '🚀 全员确认，开始下一轮！', 'success');
-      setTimeout(() => {
-        tryStartNextRound(roomId, game);
-      }, 1000);
-    }
+  function join(socket, room, name) {
+    const id = randomUUID(), result = room.game.addPlayer(id, name);
+    if (!result.success) return result;
+    const token = randomBytes(32).toString('base64url');
+    const session = { token, playerId: id, roomId: room.game.roomId, socketId: null, recent: new Map() };
+    room.members.set(id, token); sessions.set(token, session);
+    const joined = attach(socket, room, session); message(room, `${name} 加入了房间`); return joined;
   }
-}
-
-// 尝试开始下一轮（所有人确认后调用）
-async function tryStartNextRound(roomId, game) {
-  const botManager = botManagers.get(roomId);
-  
-  // 机器人自动重购（筹码为0时）
-  if (botManager) {
-    botManager.autoRebuyAll();
-  }
-
-  if (!game.prepareNextRound()) {
-    broadcastMessage(roomId, '🏁 20轮结束！查看结算', 'success');
-    broadcastGameState(roomId);
-
-    // 机器人自动确认总结
-    if (botManager) {
-      await botManager.allBotsConfirmSettlement();
-      broadcastGameState(roomId);
-    }
-    return;
-  }
-
-  if (!game.startRound()) {
-    // 有筹码的玩家不足2人
-    broadcastMessage(roomId, '⚠️ 有筹码的玩家不足2人，请重购后重新准备', 'warning');
-    game.phase = GAME_PHASES.WAITING;
-    for (const [, p] of game.players) { p.isReady = false; }
-    broadcastGameState(roomId);
-    return;
-  }
-
-  broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮`, 'phase');
-  const nextPlayer = game.getCurrentPlayer();
-  if (nextPlayer) {
-    broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
-  }
-  broadcastGameState(roomId);
-  startTurnTimer(roomId);
-  
-  // 检查首个玩家是否是机器人
-  if (nextPlayer && botManager && botManager.isBot(nextPlayer.id)) {
-    await triggerBotAction(roomId, game, botManager);
-  }
-}
-
-// 触发机器人行动并通过 handleActionResult 处理后续流转
-async function triggerBotAction(roomId, game, botManager) {
-  const currentPlayer = game.getCurrentPlayer();
-  if (!currentPlayer || !botManager.isBot(currentPlayer.id)) return;
-
-  const state = game.getState(currentPlayer.id);
-  const botResult = await botManager.checkAndActBot(state);
-  if (botResult && botResult.result && botResult.result.success) {
-    await handleActionResult(roomId, game, botResult.result, botResult.player, botResult.action);
-  }
-}
-
-// 统一处理操作结果
-async function handleActionResult(roomId, game, result, player, action) {
-  const botManager = botManagers.get(roomId);
-  
-  // 非机器人行动时才广播消息(机器人自己会广播)
-  if (!botManager || !botManager.isBot(player.id)) {
-    let actionMsg = '';
-    switch (action) {
-      case 'fold': actionMsg = `${player.name} 弃牌`; break;
-      case 'check': actionMsg = `${player.name} 过牌`; break;
-      case 'call': actionMsg = `${player.name} 跟注 ${result.amount}`; break;
-      case 'raise': actionMsg = `${player.name} 加注 ${result.amount}`; break;
-      case 'allin': actionMsg = `${player.name} 全下 ${result.amount}`; break;
-    }
-    broadcastMessage(roomId, actionMsg);
-  }
-
-  if (result.roundEnded || (result.phaseChanged && game.phase === GAME_PHASES.SHOWDOWN)) {
-    // 本轮结束 → 进入 SHOWDOWN，等待全员确认
-    await enterShowdown(roomId, game);
-  } else {
-    // 正常推进
-    broadcastGameState(roomId);
-    if (result.phaseChanged) {
-      const phaseNames = { flop: '翻牌', turn: '转牌', river: '河牌' };
-      broadcastMessage(roomId, `--- ${phaseNames[result.newPhase] || result.newPhase} ---`, 'phase');
-      startTurnTimer(roomId);
-    }
-    const nextPlayer = game.getCurrentPlayer();
-    if (nextPlayer && game.phase !== GAME_PHASES.SHOWDOWN) {
-      broadcastMessage(roomId, `等待 ${nextPlayer.name} 操作...`);
-      
-      // 检查是否轮到机器人,如果是则触发行动
-      if (botManager && botManager.isBot(nextPlayer.id)) {
-        await triggerBotAction(roomId, game, botManager);
-      }
-    }
-  }
-}
-
-/**
- * 尝试自动重连：检查房间中是否有同名断线玩家
- * 如果有，执行重连并返回 player；否则返回 null
- */
-function tryAutoReconnect(socket, game, roomId, playerName) {
-  let oldPlayerId = null;
-  for (const [pid, player] of game.players) {
-    if (player.name === playerName && !player.isConnected) {
-      oldPlayerId = pid;
-      break;
-    }
-  }
-  if (!oldPlayerId) return null;
-
-  // 取消断线计时器
-  const dcInfo = disconnectTimers.get(oldPlayerId);
-  if (dcInfo) {
-    clearTimeout(dcInfo.timer);
-    disconnectTimers.delete(oldPlayerId);
-  }
-
-  const player = game.reconnectPlayer(oldPlayerId, socket.id);
-  if (!player) return null;
-
-  socket.join(roomId);
-  playerRooms.set(socket.id, roomId);
-  playerRooms.delete(oldPlayerId);
-
-  console.log(`自动重连: ${playerName} (${oldPlayerId} → ${socket.id}) 房间 ${roomId}`);
-  broadcastMessage(roomId, `🔄 ${playerName} 重新连接`);
-  broadcastGameState(roomId);
-  return player;
-}
-
-io.on('connection', (socket) => {
-  console.log(`玩家连接: ${socket.id}`);
-
-  socket.on('createRoom', (data, callback) => {
-    const { playerName } = data;
-    const roomId = createRoom();
-    const game = rooms.get(roomId);
-    socket.join(roomId);
-    const result = game.addPlayer(socket.id, playerName);
-    if (result.success) {
-      playerRooms.set(socket.id, roomId);
-      callback({ success: true, roomId, seatIndex: result.seatIndex });
-      broadcastGameState(roomId);
-      broadcastMessage(roomId, `${playerName} 创建了房间`);
+  function leave(socket, explicit) {
+    const session = socket.data.session; if (!session || session.socketId !== socket.id) return;
+    socket.data.session = null; session.socketId = null;
+    const room = rooms.get(session.roomId); if (!room) return;
+    socket.leave(session.roomId);
+    if (explicit) {
+      room.game.removePlayer(session.playerId); room.members.delete(session.playerId); sessions.delete(session.token); clearTimeout(session.expiryTimer);
     } else {
-      callback({ success: false, message: result.message });
+      room.game.markDisconnected(session.playerId);
+      session.expiryTimer = setTimeout(() => {
+        if (session.socketId || !rooms.has(session.roomId)) return;
+        room.game.removePlayer(session.playerId); room.members.delete(session.playerId); sessions.delete(session.token);
+        if (![...room.game.players.values()].some(p => !p.isBot && !p.departed)) destroyRoom(room); else drive(room);
+      }, disconnectTimeout);
+      session.expiryTimer.unref();
     }
-  });
-
-  socket.on('joinRoom', (data, callback) => {
-    const { roomId, playerName } = data;
-    const upperRoomId = roomId.toUpperCase();
-    const game = rooms.get(upperRoomId);
-    if (!game) { callback({ success: false, message: '房间不存在' }); return; }
-
-    // 检查是否有同名断线玩家 → 自动走重连
-    const reconnected = tryAutoReconnect(socket, game, upperRoomId, playerName);
-    if (reconnected) {
-      callback({ success: true, roomId: upperRoomId, seatIndex: reconnected.seatIndex });
-      return;
+    if (![...room.game.players.values()].some(p => !p.isBot && !p.departed)) destroyRoom(room); else drive(room);
+  }
+  io.on('connection', socket => {
+    let budgetStart = Date.now(), budget = 0, chatStart = 0, chatCount = 0;
+    const preSessionRecent = new Map();
+    function command(event, fn, { requireRoom = true, host = false } = {}) {
+      socket.on(event, (data, callback) => {
+        const ack = typeof callback === 'function' ? callback : () => {};
+        try {
+          if (!data || typeof data !== 'object' || Array.isArray(data)) return ack(failure('请求格式错误，请刷新页面'));
+          if (data.protocolVersion !== PROTOCOL_VERSION) return ack(failure('版本已更新，请刷新页面'));
+          if (typeof data.requestId !== 'string' || data.requestId.length < 1 || data.requestId.length > 80) return ack(failure('缺少操作标识'));
+          const session = socket.data.session, recent = session?.recent || preSessionRecent;
+          const old = recent.get(data.requestId) || preSessionRecent.get(data.requestId);
+          if (old) return ack(old.event === event ? old.response : failure('操作标识已使用'));
+          if (Date.now() - budgetStart > 10000) { budgetStart = Date.now(); budget = 0; }
+          if (++budget > (options.rateLimit ?? 80)) return ack(failure('操作太频繁，请稍后再试'));
+          const room = session && rooms.get(session.roomId);
+          if (requireRoom && (!room || session.socketId !== socket.id)) return ack(failure('请先加入房间'));
+          if (host && room.game.hostPlayerId !== session.playerId) return ack(failure('只有房主可以操作'));
+          const response = fn(data, room, session) || { success: true };
+          recent.set(data.requestId, { event, response }); if (recent.size > 128) recent.delete(recent.keys().next().value);
+          ack(response);
+          const currentRoom = rooms.get(socket.data.session?.roomId); if (currentRoom) drive(currentRoom);
+        } catch (error) { console.error(`Rejected ${event}:`, error.message); ack(failure('操作未完成，请刷新状态后再试')); }
+      });
     }
-
-    socket.join(upperRoomId);
-    const result = game.addPlayer(socket.id, playerName);
-    if (result.success) {
-      playerRooms.set(socket.id, upperRoomId);
-      callback({ success: true, roomId: upperRoomId, seatIndex: result.seatIndex });
-      broadcastGameState(upperRoomId);
-      broadcastMessage(upperRoomId, `${playerName} 加入了房间`);
-    } else {
-      callback({ success: false, message: result.message });
-    }
-  });
-
-  // 断线重连
-  socket.on('rejoinRoom', (data, callback) => {
-    const { roomId, playerName } = data;
-    const upperRoomId = roomId.toUpperCase();
-    const game = rooms.get(upperRoomId);
-    if (!game) {
-      callback({ success: false, message: '房间不存在或已解散' });
-      return;
-    }
-
-    const player = tryAutoReconnect(socket, game, upperRoomId, playerName);
-    if (player) {
-      callback({ success: true, roomId: upperRoomId, seatIndex: player.seatIndex });
-    } else {
-      callback({ success: false, message: '未找到断线记录，请重新加入' });
-    }
-  });
-
-  socket.on('quickJoin', (data, callback) => {
-    const { playerName } = data;
-    let joined = false;
-
-    // 先检查所有房间是否有同名断线玩家 → 自动重连
-    for (const [roomId, game] of rooms) {
-      const reconnected = tryAutoReconnect(socket, game, roomId, playerName);
-      if (reconnected) {
-        callback({ success: true, roomId, seatIndex: reconnected.seatIndex });
-        return;
+    const nameFrom = data => typeof data.playerName === 'string' && data.playerName.trim().length >= 1 && data.playerName.trim().length <= 16 ? data.playerName.trim() : null;
+    for (const event of ['createRoom', 'joinRoom', 'quickJoin']) command(event, data => {
+      if (socket.data.session) return failure('请先离开当前房间');
+      const name = nameFrom(data); if (!name) return failure('昵称需为 1–16 个字符');
+      let room;
+      if (event === 'joinRoom') {
+        if (typeof data.roomId !== 'string' || !/^[a-f0-9]{6}$/i.test(data.roomId)) return failure('请输入正确的六位房间号');
+        room = rooms.get(data.roomId.toUpperCase()); if (!room) return failure('房间不存在或已解散');
+      } else if (event === 'quickJoin') room = [...rooms.values()].find(r => r.game.phase === 'waiting' && r.game.playerCount < 7 && humanOnline(r));
+      if (!room) {
+        if (rooms.size >= 200) return failure('当前房间较多，请稍后再试');
+        const address = socket.handshake.address;
+        const limit = createLimits.get(address) || { start: Date.now(), count: 0 };
+        if (Date.now() - limit.start > 60000) { limit.start = Date.now(); limit.count = 0; }
+        if (++limit.count > 6) return failure('创建房间太频繁，请稍后再试');
+        createLimits.set(address, limit); room = createRoom();
       }
-    }
-
-    for (const [roomId, game] of rooms) {
-      if (game.playerCount < 7 && (game.phase === GAME_PHASES.WAITING || !game.isGameStarted)) {
-        socket.join(roomId);
-        const result = game.addPlayer(socket.id, playerName);
-        if (result.success) {
-          playerRooms.set(socket.id, roomId);
-          callback({ success: true, roomId, seatIndex: result.seatIndex });
-          broadcastGameState(roomId);
-          broadcastMessage(roomId, `${playerName} 加入了房间`);
-          joined = true;
-          break;
-        }
-      }
-    }
-    if (!joined) {
-      const roomId = createRoom();
-      const game = rooms.get(roomId);
-      socket.join(roomId);
-      const result = game.addPlayer(socket.id, playerName);
-      if (result.success) {
-        playerRooms.set(socket.id, roomId);
-        callback({ success: true, roomId, seatIndex: result.seatIndex });
-        broadcastGameState(roomId);
-        broadcastMessage(roomId, `${playerName} 创建了房间`);
-      }
-    }
-  });
-
-  // 添加机器人
-  socket.on('addBot', (data, callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) {
-      if (typeof callback === 'function') callback({ success: false, message: '你不在任何房间' });
-      return;
-    }
-    const game = rooms.get(roomId);
-    const botManager = botManagers.get(roomId);
-    if (!game || !botManager) {
-      if (typeof callback === 'function') callback({ success: false, message: '房间不存在' });
-      return;
-    }
-
-    const difficulty = data?.difficulty || 'medium';
-    const result = botManager.addBot(difficulty);
-
-    if (result.success) {
-      // 如果在 SHOWDOWN 阶段添加，自动确认下一局，避免卡住流程
-      if (game.phase === GAME_PHASES.SHOWDOWN) {
-        game.confirmedNextPlayers.add(result.socketId);
-      }
-      // 如果在 SETTLED 阶段添加，自动确认结算
-      if (game.phase === GAME_PHASES.SETTLED) {
-        game.confirmedSettlement.add(result.socketId);
-      }
-      broadcastGameState(roomId);
-      broadcastMessage(roomId, `🤖 ${result.bot.name} 加入了房间`);
-      if (typeof callback === 'function') callback({ success: true, botName: result.bot.name });
-    } else {
-      if (typeof callback === 'function') callback(result);
-    }
-  });
-
-  // 移除单个机器人
-  socket.on('removeBot', (data, callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) {
-      if (typeof callback === 'function') callback({ success: false, message: '你不在任何房间' });
-      return;
-    }
-    const game = rooms.get(roomId);
-    const botManager = botManagers.get(roomId);
-    if (!game || !botManager) {
-      if (typeof callback === 'function') callback({ success: false, message: '房间不存在' });
-      return;
-    }
-
-    const { botId } = data;
-    if (!botId) {
-      if (typeof callback === 'function') callback({ success: false, message: '无效的机器人ID' });
-      return;
-    }
-
-    const bot = game.players.get(botId);
-    if (!bot) {
-      if (typeof callback === 'function') callback({ success: false, message: '机器人不存在' });
-      return;
-    }
-
-    const botName = bot.name;
-    const removed = botManager.removeBot(botId);
-    
-    if (removed) {
-      broadcastGameState(roomId);
-      broadcastMessage(roomId, `🤖 ${botName} 已离开`);
-      if (typeof callback === 'function') callback({ success: true });
-    } else {
-      if (typeof callback === 'function') callback({ success: false, message: '移除失败' });
-    }
-  });
-
-  // 准备（首轮需要准备，后续全员确认续局）
-  socket.on('ready', async (callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    const botManager = botManagers.get(roomId);
-    if (!game) return;
-
-    const player = game.players.get(socket.id);
-    if (!player) return;
-
-    player.isReady = !player.isReady;
-    broadcastGameState(roomId);
-    broadcastMessage(roomId, `${player.name} ${player.isReady ? '已准备' : '取消准备'}`);
-
-    // 机器人也准备
-    if (botManager && player.isReady) {
-      await botManager.allBotsReady();
-      broadcastGameState(roomId);
-    }
-
-    if (game.canStartGame()) {
-      setTimeout(async () => {
-        if (game.canStartGame()) {
-          game.startGame();
-          broadcastGameState(roomId);
-          broadcastMessage(roomId, `🎴 第 ${game.currentRound}/${game.maxRounds} 轮开始！`, 'success');
-          const currentPlayer = game.getCurrentPlayer();
-          if (currentPlayer) {
-            broadcastMessage(roomId, `等待 ${currentPlayer.name} 操作...`);
-          }
-          startTurnTimer(roomId);
-          
-          // 检查首个玩家是否是机器人
-          if (currentPlayer && botManager && botManager.isBot(currentPlayer.id)) {
-            await triggerBotAction(roomId, game, botManager);
-          }
-        }
-      }, 1000);
-    }
-
-    if (typeof callback === 'function') callback({ success: true });
-  });
-
-  // 确认下一局（SHOWDOWN 阶段）
-  socket.on('confirmNext', (callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-
-    const player = game.players.get(socket.id);
-    if (!player) return;
-
-    const result = game.playerConfirmNext(socket.id);
-    if (!result.success) {
-      if (typeof callback === 'function') callback(result);
-      return;
-    }
-
-    broadcastMessage(roomId, `✅ ${player.name} 确认 (${game.confirmedNextPlayers.size}/${game.players.size})`);
-    broadcastGameState(roomId);
-
-    // 全员确认 → 开始下一轮
-    if (game.allConfirmedNext) {
-      broadcastMessage(roomId, '🚀 全员确认，开始下一轮！', 'success');
-      setTimeout(() => {
-        tryStartNextRound(roomId, game);
-      }, 1000);
-    }
-
-    if (typeof callback === 'function') callback({ success: true });
-  });
-
-
-  // 确认总结（20轮结束后）
-  socket.on('confirmSettlement', (callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-
-    const player = game.players.get(socket.id);
-    if (!player) return;
-
-    const result = game.playerConfirmSettlement(socket.id);
-    if (!result.success) {
-      if (typeof callback === 'function') callback(result);
-      return;
-    }
-
-    broadcastMessage(roomId, `✅ ${player.name} 已确认总结 (${game.confirmedSettlement.size}/${game.players.size})`);
-    broadcastGameState(roomId);
-
-    if (game.allConfirmedSettlement) {
-      broadcastMessage(roomId, '🎉 全员确认！现在可以开始新的比赛了', 'success');
-    }
-
-    if (typeof callback === 'function') callback({ success: true });
-  });
-  // 玩家操作
-  socket.on('action', (data, callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-
-    const { action, amount } = data;
-    const player = game.players.get(socket.id);
-    if (!player) return;
-
-    const result = game.playerAction(socket.id, action, amount || 0);
-
-    if (result.success) {
-      handleActionResult(roomId, game, result, player, action);
-    }
-
-    if (typeof callback === 'function') callback(result);
-  });
-
-  // 重购积分
-  socket.on('rebuy', (callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-
-    if (game.phase !== GAME_PHASES.WAITING && game.phase !== GAME_PHASES.SHOWDOWN && game.phase !== GAME_PHASES.SETTLED) {
-      if (typeof callback === 'function') callback({ success: false, message: '对局进行中，无法重购' });
-      return;
-    }
-
-    const result = game.playerRebuy(socket.id);
-    if (result.success) {
-      const player = game.players.get(socket.id);
-      broadcastMessage(roomId, `💰 ${player.name} 重购了 ${result.amount} 筹码`);
-      broadcastGameState(roomId);
-    }
-    if (typeof callback === 'function') callback(result);
-  });
-
-  // 重新开始整场
-socket.on('restart', (callback) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-
-    // 在 SETTLED 阶段需要所有人确认后才能重启
-    if (game.phase === GAME_PHASES.SETTLED) {
-      if (!game.allConfirmedSettlement) {
-        if (typeof callback === 'function') {
-          callback({ success: false, message: '需要所有玩家确认总结后才能重新开始' });
-        }
-        return;
-      }
-    }
-
-    game.restartGame();
-    clearTurnTimer(roomId);
-    broadcastMessage(roomId, '🔄 比赛已重置，请重新准备', 'success');
-    broadcastGameState(roomId);
-    if (typeof callback === 'function') callback({ success: true });
-  });
-
-  // 聊天
-  socket.on('chat', (data) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-    const player = game.players.get(socket.id);
-    if (!player) return;
-
-    io.to(roomId).emit('chat', {
-      playerName: player.name,
-      message: data.message,
-      timestamp: Date.now(),
+      return join(socket, room, name);
+    }, { requireRoom: false });
+    command('rejoinRoom', data => {
+      if (socket.data.session) return failure('已连接到房间');
+      if (typeof data.sessionToken !== 'string') return failure('没有可恢复的连接，请重新加入');
+      const session = sessions.get(data.sessionToken), room = session && rooms.get(session.roomId);
+      if (!room || !room.game.players.has(session.playerId)) return failure('房间或重连记录已过期，请重新加入');
+      return attach(socket, room, session);
+    }, { requireRoom: false });
+    command('leaveRoom', () => { leave(socket, true); return { success: true }; });
+    command('ready', (data, room, session) => {
+      if (typeof data.ready !== 'boolean') return failure('准备状态无效');
+      if (!room.game.setPlayerReady(session.playerId, data.ready)) return failure('当前无法修改准备状态');
+      room.bots.allBotsReady(); return { success: true };
     });
+    command('addBot', (data, room) => {
+      const result = room.bots.addBot(data.difficulty || 'medium', data.style || 'balanced');
+      return result.success ? { success: true, botName: result.bot.name, botId: result.socketId } : result;
+    }, { host: true });
+    command('removeBot', (data, room) => ({ success: room.bots.removeBot(data.botId), message: '请在两手之间移除有效的机器人' }), { host: true });
+    command('action', (data, room, session) => {
+      if (typeof data.turnId !== 'string' || data.handId !== room.game.handId) return failure('牌局已更新，请重试');
+      return room.game.playerAction(session.playerId, data.action, data.amount ?? 0, data.turnId);
+    });
+    command('confirmNext', (data, room, session) => data.handId === room.game.handId ? room.game.playerConfirmNext(session.playerId) : failure('本手结果已更新'));
+    command('confirmSettlement', (data, room, session) => data.handId === room.game.handId ? room.game.playerConfirmSettlement(session.playerId) : failure('比赛结果已更新'));
+    command('rebuy', (data, room, session) => room.game.playerRebuy(session.playerId));
+    command('restart', (data, room) => {
+      const result = room.game.restartGame();
+      if (result.success) { clearScheduled(room); for (const b of room.bots.bots.values()) b.opponentMemory.clear(); }
+      return result;
+    }, { host: true });
+    command('chat', (data, room, session) => {
+      if (typeof data.message !== 'string' || !data.message.trim() || data.message.length > 60) return failure('消息需为 1–60 个字符');
+      if (Date.now() - chatStart > 10000) { chatStart = Date.now(); chatCount = 0; }
+      if (++chatCount > 8) return failure('消息太频繁，请稍后再试');
+      io.to(room.game.roomId).emit('chat', { playerName: room.game.players.get(session.playerId).name, message: data.message.trim(), timestamp: Date.now() });
+      return { success: true };
+    });
+    socket.on('disconnect', () => leave(socket, false));
   });
-
-  socket.on('disconnect', () => {
-    console.log(`玩家断开: ${socket.id}`);
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
-    const game = rooms.get(roomId);
-    if (!game) return;
-
-    const player = game.players.get(socket.id);
-    if (!player) return;
-    const playerName = player.name;
-
-    // 标记断线，而不是立即移除
-    const dcResult = game.markDisconnected(socket.id);
-    broadcastMessage(roomId, `⚠️ ${playerName} 断线（5分钟内可重连）`, 'warning');
-
-    // 检查所有已连接的玩家数量
-    const connectedPlayers = [...game.players.values()].filter(p => p.isConnected);
-    if (connectedPlayers.length === 0) {
-      clearTurnTimer(roomId);
-    }
-
-    // 如果断线触发了 endRound
-    if (dcResult && dcResult.roundEnded && game.phase === GAME_PHASES.SHOWDOWN) {
-      enterShowdown(roomId, game);
-    } else if (game.phase === GAME_PHASES.SHOWDOWN && game.allConfirmedNext) {
-      broadcastMessage(roomId, '🚀 全员确认，开始下一轮！', 'success');
-      setTimeout(() => {
-        tryStartNextRound(roomId, game);
-      }, 1000);
-    } else {
-      broadcastGameState(roomId);
-    }
-
-    // 5分钟后真正移除玩家
-    const dcTimer = setTimeout(() => {
-      disconnectTimers.delete(socket.id);
-      const currentGame = rooms.get(roomId);
-      if (!currentGame) return;
-      const currentPlayer = currentGame.players.get(socket.id);
-      if (!currentPlayer || currentPlayer.isConnected) return;
-
-      console.log(`断线超时移除: ${playerName} (${socket.id})`);
-      const wasInGame = currentGame.isGameStarted
-        && currentGame.phase !== GAME_PHASES.WAITING
-        && currentGame.phase !== GAME_PHASES.SETTLED
-        && currentGame.phase !== GAME_PHASES.SHOWDOWN;
-
-      currentGame.removePlayer(socket.id);
-      playerRooms.delete(socket.id);
-      broadcastMessage(roomId, `${playerName} 断线超时，已移出房间`);
-
-      if (currentGame.playerCount === 0) {
-        clearTurnTimer(roomId);
-        rooms.delete(roomId);
-        console.log(`房间 ${roomId} 已删除`);
-        return;
-      }
-
-      if (wasInGame && currentGame.phase === GAME_PHASES.SHOWDOWN) {
-        enterShowdown(roomId, currentGame);
-      } else if (currentGame.phase === GAME_PHASES.SHOWDOWN && currentGame.allConfirmedNext) {
-        broadcastMessage(roomId, '🚀 全员确认，开始下一轮！', 'success');
-        setTimeout(() => {
-          tryStartNextRound(roomId, currentGame);
-        }, 1000);
-      } else {
-        broadcastGameState(roomId);
-      }
-    }, DISCONNECT_TIMEOUT);
-
-    disconnectTimers.set(socket.id, { timer: dcTimer, roomId, playerName });
-  });
-});
-
-// 定期清理：无人在线的房间
-setInterval(() => {
-  for (const [roomId, game] of rooms) {
-    const connectedPlayers = [...game.players.values()].filter(p => p.isConnected);
-    if (connectedPlayers.length === 0 && game.players.size === 0) {
-      clearTurnTimer(roomId);
-      rooms.delete(roomId);
-      console.log(`[清理] 空房间 ${roomId} 已删除`);
-    }
-  }
-}, 60 * 1000); // 每分钟检查一次
-
-const PORT = process.env.PORT || 3000;
-const HOST = '0.0.0.0';
-server.listen(PORT, HOST, () => {
-  console.log(`\n🃏 德州扑克服务器已启动`);
-  console.log(`📍 地址: http://${HOST}:${PORT}`);
-  console.log(`\n等待玩家加入...\n`);
-});
+  const housekeeping = setInterval(() => { for (const [address, record] of createLimits) if (Date.now() - record.start > 60000) createLimits.delete(address); }, 60000);
+  housekeeping.unref();
+  async function close() { closed = true; clearInterval(housekeeping); for (const room of rooms.values()) destroyRoom(room); await pool.close(); await new Promise(resolve => io.close(resolve)); }
+  return { app, server, io, rooms, sessions, drive, close };
+}
+if (require.main === module) {
+  const runtime = createPokerServer();
+  runtime.server.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log(`Poker server listening on ${runtime.server.address().port}`));
+  for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => runtime.close().then(() => process.exit(0)));
+}
+module.exports = { createPokerServer, PROTOCOL_VERSION };

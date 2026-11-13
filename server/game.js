@@ -1,978 +1,330 @@
-/**
- * 德州扑克游戏核心逻辑
- * - 20轮制
- * - 重购积分
- * - 2分钟倒计时
- * - 庄家/大盲/小盲位置标记
- * - SHOWDOWN 阶段需全员确认才续局
- */
-
+/** Server-authoritative, integer-chip no-limit hold'em engine. */
 const { Deck } = require('./deck');
-const { evaluateBestHand, determineWinners } = require('./handEvaluator');
-
+const { evaluateBestHand, compareHands } = require('./handEvaluator');
 const MAX_PLAYERS = 7;
-const MAX_ROUNDS = 20;
-const INITIAL_CHIPS = 1000;
-const REBUY_AMOUNT = 1000;
-const ACTION_TIMEOUT = 120; // 2分钟（秒）
-
-const GAME_PHASES = {
-  WAITING: 'waiting',
-  PRE_FLOP: 'pre_flop',
-  FLOP: 'flop',
-  TURN: 'turn',
-  RIVER: 'river',
-  SHOWDOWN: 'showdown',
-  SETTLED: 'settled',
-};
-
-const PLAYER_STATUS = {
-  ACTIVE: 'active',
-  FOLDED: 'folded',
-  ALL_IN: 'all_in',
-  SITTING_OUT: 'sitting_out',
-};
+const GAME_PHASES = Object.freeze({ WAITING: 'waiting', PRE_FLOP: 'pre_flop', FLOP: 'flop', TURN: 'turn', RIVER: 'river', SHOWDOWN: 'showdown', SETTLED: 'settled' });
+const PLAYER_STATUS = Object.freeze({ ACTIVE: 'active', FOLDED: 'folded', ALL_IN: 'all_in', SITTING_OUT: 'sitting_out' });
+const LIVE = new Set(['pre_flop', 'flop', 'turn', 'river']);
+const fail = message => ({ success: false, message });
+const cardJSON = c => c.toJSON ? c.toJSON() : { ...c };
 
 class Player {
-  constructor(id, name, seatIndex) {
-    this.id = id;
-    this.name = name;
-    this.seatIndex = seatIndex;
-    this.chips = INITIAL_CHIPS;
-    this.initialChips = INITIAL_CHIPS;
-    this.totalBuyIn = INITIAL_CHIPS;
-    this.holeCards = [];
-    this.currentBet = 0;
-    this.totalBetThisRound = 0;
-    this.status = PLAYER_STATUS.ACTIVE;
-    this.isReady = false;
-    this.isConnected = true;
+  constructor(id, name, seatIndex, options = {}) {
+    Object.assign(this, { id, name, seatIndex, chips: 1000, totalBuyIn: 1000, holeCards: [], currentBet: 0, totalBetThisRound: 0,
+      status: PLAYER_STATUS.SITTING_OUT, isReady: false, isConnected: true, departed: false, isBot: false, ...options });
   }
-
   reset() {
-    this.holeCards = [];
-    this.currentBet = 0;
-    this.totalBetThisRound = 0;
-    if (this.chips > 0) {
-      this.status = PLAYER_STATUS.ACTIVE;
-    } else {
-      this.status = PLAYER_STATUS.SITTING_OUT;
-    }
+    this.holeCards = []; this.currentBet = 0; this.totalBetThisRound = 0;
+    this.status = PLAYER_STATUS.SITTING_OUT;
   }
-
-  rebuy() {
-    if (this.chips > 0) return { success: false, message: '还有筹码，无需重购' };
-    this.chips = REBUY_AMOUNT;
-    this.totalBuyIn += REBUY_AMOUNT;
-    this.status = PLAYER_STATUS.ACTIVE;
-    return { success: true, amount: REBUY_AMOUNT };
-  }
-
-  toJSON(revealCards = false) {
-    return {
-      id: this.id,
-      name: this.name,
-      seatIndex: this.seatIndex,
-      chips: this.chips,
-      holeCards: revealCards ? this.holeCards : this.holeCards.map(() => null),
-      currentBet: this.currentBet,
-      status: this.status,
-      isReady: this.isReady,
-      isConnected: this.isConnected,
-      totalBuyIn: this.totalBuyIn,
-    };
+  toJSON(reveal = false) {
+    const { id, name, seatIndex, chips, currentBet, status, isReady, isConnected, totalBuyIn, isBot, difficulty, style } = this;
+    return { id, name, seatIndex, chips, currentBet, status, isReady, isConnected, totalBuyIn, isBot, difficulty, style,
+      holeCards: this.holeCards.map(c => reveal ? cardJSON(c) : null) };
   }
 }
 
 class Game {
-  constructor(roomId) {
-    this.roomId = roomId;
-    this.players = new Map();
-    this.seatOrder = [];
-    this.deck = new Deck();
-    this.communityCards = [];
-    this.pot = 0;
-    this.sidePots = [];
-    this.phase = GAME_PHASES.WAITING;
-    this.dealerIndex = -1;
-    this.currentPlayerIndex = -1;
-    this.smallBlind = 10;
-    this.bigBlind = 20;
-    this.currentBet = 0;
-    this.minRaise = 0;
-    this.lastRaiserIndex = -1;
-    this.roundHistory = [];
-
-    // 20轮制
-    this.currentRound = 0;
-    this.maxRounds = MAX_ROUNDS;
-    this.isGameStarted = false;
-
-    // 倒计时
-    this.turnStartTime = null;
-    this.turnTimeLimit = ACTION_TIMEOUT;
-
-    // 位置标记
-    this.sbSeatIndex = -1;
-    this.bbSeatIndex = -1;
-
-    // SHOWDOWN 确认续局
-    // SETTLED 阶段确认总结
-    this.confirmedSettlement = new Set();
-
-    this.confirmedNextPlayers = new Set();
-
-    // 是否为实际摊牌（多人对决，非全员弃牌）
-    this.isActualShowdown = false;
+  constructor(roomId, options = {}) {
+    this.roomId = roomId; this.players = new Map(); this.departedPlayers = new Map();
+    this.seatOrder = []; this.deck = options.deck || new Deck(); this.communityCards = [];
+    this.pot = 0; this.lastPot = 0; this.sidePots = []; this.phase = GAME_PHASES.WAITING;
+    this.dealerSeat = -1; this.dealerIndex = -1; this.currentPlayerIndex = -1;
+    this.smallBlind = 10; this.bigBlind = 20; this.currentBet = 0; this.minRaise = 20;
+    this.roundHistory = []; this.currentRound = 0; this.maxRounds = 20; this.isGameStarted = false;
+    this.handId = 0; this.revision = 0; this.pending = new Set(); this.actedAtBet = new Map();
+    this.turnStartTime = null; this.turnTimeLimit = 120; this.sbSeatIndex = -1; this.bbSeatIndex = -1;
+    this.confirmedNextPlayers = new Set(); this.confirmedSettlement = new Set(); this.handParticipants = new Set();
+    this.lastResults = null; this.isActualShowdown = false; this.hostPlayerId = null;
   }
-
-  get playerCount() {
-    return this.players.size;
-  }
-
-  get activePlayers() {
-    return this.seatOrder
-      .map(id => this.players.get(id))
-      .filter(p => p && p.status === PLAYER_STATUS.ACTIVE);
-  }
-
-  get activeAndAllInPlayers() {
-    return this.seatOrder
-      .map(id => this.players.get(id))
-      .filter(p => p && (p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.ALL_IN));
-  }
-
-  addPlayer(id, name) {
-    if (this.players.size >= MAX_PLAYERS) {
-      return { success: false, message: '房间已满（最多7人）' };
-    }
-    if (this.players.has(id)) {
-      return { success: false, message: '已在房间中' };
-    }
-
-    const takenSeats = new Set([...this.players.values()].map(p => p.seatIndex));
-    let seatIndex = -1;
-    for (let i = 0; i < MAX_PLAYERS; i++) {
-      if (!takenSeats.has(i)) {
-        seatIndex = i;
-        break;
-      }
-    }
-
-    const player = new Player(id, name, seatIndex);
+  get playerCount() { return [...this.players.values()].filter(p => !p.departed).length; }
+  get isLive() { return LIVE.has(this.phase); }
+  get activePlayers() { return this.seatOrder.map(id => this.players.get(id)).filter(p => p?.status === 'active'); }
+  get activeAndAllInPlayers() { return this.seatOrder.map(id => this.players.get(id)).filter(p => p && ['active', 'all_in'].includes(p.status)); }
+  get turnId() { return this.isLive ? `${this.handId}:${this.revision}:${this.getCurrentPlayer()?.id || ''}` : null; }
+  touch() { this.revision++; }
+  addPlayer(id, name, options = {}) {
+    if (this.players.size >= MAX_PLAYERS) return fail('房间已满（最多7人）');
+    if (this.players.has(id)) return fail('已在房间中');
+    const taken = new Set([...this.players.values()].map(p => p.seatIndex));
+    const seat = Array.from({ length: MAX_PLAYERS }, (_, i) => i).find(i => !taken.has(i));
+    const player = new Player(id, name, seat, options);
     this.players.set(id, player);
-
-    // 游戏进行中不修改 seatOrder，避免破坏当前轮次的索引
-    // 新玩家会在下一轮 startRound() 时自动加入
-    const isActiveRound = this.phase !== GAME_PHASES.WAITING
-      && this.phase !== GAME_PHASES.SETTLED
-      && this.phase !== GAME_PHASES.SHOWDOWN;
-
-    if (isActiveRound) {
-      player.status = PLAYER_STATUS.SITTING_OUT;
-    } else {
-      this.seatOrder.push(id);
-      this.seatOrder.sort((a, b) => {
-        return this.players.get(a).seatIndex - this.players.get(b).seatIndex;
-      });
-    }
-
-    return { success: true, player, seatIndex };
+    if (!player.isBot && !this.hostPlayerId) this.hostPlayerId = id;
+    // Membership changes never change the current hand's ordering or turn token.
+    return { success: true, player, seatIndex: seat };
   }
-
-  // 标记玩家断线（不移除）
+  transferHost() {
+    const host = this.players.get(this.hostPlayerId);
+    if (host?.isConnected && !host.departed) return;
+    this.hostPlayerId = [...this.players.values()].find(p => !p.isBot && p.isConnected && !p.departed)?.id || null;
+  }
   markDisconnected(id) {
-    const player = this.players.get(id);
-    if (!player) return null;
-    player.isConnected = false;
-
-    // 如果在游戏中且轮到该玩家，自动弃牌
-    if (this.phase !== GAME_PHASES.WAITING && this.phase !== GAME_PHASES.SETTLED && this.phase !== GAME_PHASES.SHOWDOWN) {
-      if (this.seatOrder[this.currentPlayerIndex] === id && player.status === PLAYER_STATUS.ACTIVE) {
-        player.status = PLAYER_STATUS.FOLDED;
-        this.roundHistory.push({ type: 'action', playerId: id, playerName: player.name, action: 'fold', amount: 0 });
-        if (this.activeAndAllInPlayers.length <= 1) {
-          this.endRound();
-          return { player, roundEnded: true };
-        }
-        this.nextPlayer();
-      }
-    }
-
-    // SHOWDOWN 阶段，断线玩家自动确认
-    if (this.phase === GAME_PHASES.SHOWDOWN) {
-      this.confirmedNextPlayers.add(id);
-    }
-
-    // SETTLED 阶段，断线玩家自动确认
-    if (this.phase === GAME_PHASES.SETTLED) {
-      this.confirmedSettlement.add(id);
-    }
-
-    return { player, roundEnded: false };
+    const p = this.players.get(id); if (!p) return null;
+    p.isConnected = false; this.transferHost();
+    // A disconnected player keeps their hand until their turn (all-ins stay live).
+    if (this.isLive && this.getCurrentPlayer()?.id === id) this.progress(this.currentPlayerIndex - 1);
+    return { player: p, roundEnded: this.phase === 'showdown' };
   }
-
-  // 玩家重连（替换 socket ID）
-  reconnectPlayer(oldId, newId) {
-    const player = this.players.get(oldId);
-    if (!player) return null;
-
-    player.id = newId;
-    player.isConnected = true;
-    this.players.delete(oldId);
-    this.players.set(newId, player);
-    this.seatOrder = this.seatOrder.map(pid => pid === oldId ? newId : pid);
-
-    // 更新确认状态
-    if (this.confirmedNextPlayers.has(oldId)) {
-      this.confirmedNextPlayers.delete(oldId);
-      this.confirmedNextPlayers.add(newId);
-    }
-
-    return player;
+  reconnectPlayer(id) {
+    const p = this.players.get(id); if (!p || p.departed) return null;
+    p.isConnected = true; if (!this.hostPlayerId) this.hostPlayerId = id;
+    return p;
   }
-
   removePlayer(id) {
-    const player = this.players.get(id);
-    if (!player) return;
-
-    this.players.delete(id);
-    this.seatOrder = this.seatOrder.filter(pid => pid !== id);
-    this.confirmedNextPlayers.delete(id);
-    this.confirmedSettlement.delete(id);
-
-    if (this.phase !== GAME_PHASES.WAITING && this.phase !== GAME_PHASES.SETTLED) {
-      if (this.phase === GAME_PHASES.SHOWDOWN) {
-        // SHOWDOWN 阶段，玩家离开不需要 endRound，只需更新确认状态
-        // 外部会检查 allConfirmed
-      } else if (this.activeAndAllInPlayers.length <= 1) {
-        this.endRound();
-      } else if (this.currentPlayerIndex >= this.seatOrder.length) {
-        this.currentPlayerIndex = 0;
-        this.nextPlayer();
-      } else if (this.seatOrder[this.currentPlayerIndex] === id) {
-        this.nextPlayer();
-      }
-    }
-
-    return player;
+    const p = this.players.get(id); if (!p) return null;
+    p.departed = true; p.isConnected = false; this.transferHost();
+    if (this.isLive && this.handParticipants.has(id)) {
+      if (p.status === 'active') { p.status = 'folded'; this.pending.delete(id); }
+      // Preserve contributed chips and an all-in hand until settlement.
+      this.progress(this.currentPlayerIndex - 1);
+    } else this.archivePlayer(p);
+    return p;
   }
-
+  archivePlayer(p) {
+    this.departedPlayers.set(p.id, { id: p.id, name: p.name, seatIndex: p.seatIndex, finalChips: p.chips, totalBuyIn: p.totalBuyIn, profit: p.chips - p.totalBuyIn, departed: true });
+    this.players.delete(p.id); this.confirmedNextPlayers.delete(p.id); this.confirmedSettlement.delete(p.id);
+  }
   setPlayerReady(id, ready) {
-    const player = this.players.get(id);
-    if (!player) return false;
-    player.isReady = ready;
-    return true;
+    const p = this.players.get(id); if (!p || this.isLive || this.phase === 'settled') return false;
+    p.isReady = !!ready; return true;
   }
-
   canStartGame() {
-    const readyPlayers = [...this.players.values()].filter(p => p.isReady && p.chips > 0);
-    return readyPlayers.length >= 2 && this.phase === GAME_PHASES.WAITING;
+    const participants = [...this.players.values()].filter(p => p.isConnected && !p.departed && p.chips > 0);
+    return this.phase === 'waiting' && participants.length >= 2 && participants.some(p => !p.isBot) && participants.every(p => p.isReady);
   }
-
-  // 开始一轮
-  startRound() {
-    this.deck.reset();
-    this.communityCards = [];
-    this.pot = 0;
-    this.sidePots = [];
-    this.currentBet = 0;
-    this.roundHistory = [];
-    this.lastResults = null;
-    this.confirmedNextPlayers.clear();
-
-    // 有筹码的玩家参与
-    this.seatOrder = [...this.players.values()]
-      .filter(p => p.chips > 0)
-      .sort((a, b) => a.seatIndex - b.seatIndex)
-      .map(p => p.id);
-
-    if (this.seatOrder.length < 2) return false;
-
-    for (const id of this.seatOrder) {
-      this.players.get(id).reset();
-    }
-
-    // 移动庄家位
-    this.dealerIndex = (this.dealerIndex + 1) % this.seatOrder.length;
-
-    // 发底牌
-    for (const id of this.seatOrder) {
-      const player = this.players.get(id);
-      if (player.status !== PLAYER_STATUS.SITTING_OUT) {
-        player.holeCards = this.deck.dealMultiple(2);
-      }
-    }
-
-    this.postBlinds();
-    this.phase = GAME_PHASES.PRE_FLOP;
-    this.currentRound++;
-    this.turnStartTime = Date.now();
-
-    return true;
-  }
-
-  // 首次开始整场比赛
   startGame() {
     if (!this.canStartGame()) return false;
     this.isGameStarted = true;
-    this.currentRound = 0;
-    this.dealerIndex = -1;
-
-    // 重置所有玩家的买入记录
-    for (const [, player] of this.players) {
-      player.totalBuyIn = player.chips;
-    }
-
     return this.startRound();
   }
-
-  postBlinds() {
-    const numPlayers = this.seatOrder.length;
-    let sbIndex, bbIndex;
-
-    if (numPlayers === 2) {
-      sbIndex = this.dealerIndex;
-      bbIndex = (this.dealerIndex + 1) % numPlayers;
-    } else {
-      sbIndex = (this.dealerIndex + 1) % numPlayers;
-      bbIndex = (this.dealerIndex + 2) % numPlayers;
-    }
-
-    const sbPlayer = this.players.get(this.seatOrder[sbIndex]);
-    const bbPlayer = this.players.get(this.seatOrder[bbIndex]);
-
-    this.sbSeatIndex = sbPlayer.seatIndex;
-    this.bbSeatIndex = bbPlayer.seatIndex;
-
-    const sbAmount = Math.min(this.smallBlind, sbPlayer.chips);
-    sbPlayer.chips -= sbAmount;
-    sbPlayer.currentBet = sbAmount;
-    sbPlayer.totalBetThisRound = sbAmount;
-    this.pot += sbAmount;
-    if (sbPlayer.chips === 0) sbPlayer.status = PLAYER_STATUS.ALL_IN;
-
-    const bbAmount = Math.min(this.bigBlind, bbPlayer.chips);
-    bbPlayer.chips -= bbAmount;
-    bbPlayer.currentBet = bbAmount;
-    bbPlayer.totalBetThisRound = bbAmount;
-    this.pot += bbAmount;
-    if (bbPlayer.chips === 0) bbPlayer.status = PLAYER_STATUS.ALL_IN;
-
+  startRound() {
+    if (this.isLive || this.phase === 'settled' || this.currentRound >= this.maxRounds) return false;
+    const participants = [...this.players.values()].filter(p => p.isReady && p.isConnected && !p.departed && p.chips > 0).sort((a, b) => a.seatIndex - b.seatIndex);
+    if (participants.length < 2 || !participants.some(p => !p.isBot)) return false;
+    for (const p of this.players.values()) p.reset();
+    this.seatOrder = participants.map(p => p.id); this.handParticipants = new Set(this.seatOrder);
+    this.deck.reset(); this.communityCards = []; this.pot = 0; this.lastPot = 0; this.lastResults = null; this.sidePots = [];
+    this.roundHistory = []; this.confirmedNextPlayers.clear(); this.currentBet = 0; this.minRaise = this.bigBlind;
+    this.isActualShowdown = false; this.pending.clear(); this.actedAtBet.clear();
+    this.dealerSeat = (participants.find(p => p.seatIndex > this.dealerSeat) || participants[0]).seatIndex;
+    this.dealerIndex = participants.findIndex(p => p.seatIndex === this.dealerSeat);
+    for (const p of participants) { p.status = 'active'; p.holeCards = this.deck.dealMultiple(2); }
+    this.phase = 'pre_flop'; this.handId++; this.currentRound++; this.touch();
+    const n = participants.length;
+    const sb = n === 2 ? this.dealerIndex : (this.dealerIndex + 1) % n;
+    const bb = (sb + 1) % n;
+    this.sbSeatIndex = participants[sb].seatIndex; this.bbSeatIndex = participants[bb].seatIndex;
+    this.commit(participants[sb], Math.min(this.smallBlind, participants[sb].chips));
+    this.commit(participants[bb], Math.min(this.bigBlind, participants[bb].chips));
     this.currentBet = this.bigBlind;
-    this.minRaise = this.bigBlind;
-
-    if (numPlayers === 2) {
-      this.currentPlayerIndex = sbIndex;
-    } else {
-      this.currentPlayerIndex = (bbIndex + 1) % numPlayers;
-    }
-    // 设置 lastRaiserIndex 为第一个行动者（UTG），这样 BB 有机会在行动回到 UTG 之前行动
-    this.lastRaiserIndex = this.currentPlayerIndex;
-
-    this.roundHistory.push({
-      type: 'blinds',
-      smallBlind: { playerId: sbPlayer.id, amount: sbAmount },
-      bigBlind: { playerId: bbPlayer.id, amount: bbAmount },
-    });
-  }
-
-  getCurrentPlayer() {
-    if (this.currentPlayerIndex < 0 || this.currentPlayerIndex >= this.seatOrder.length) {
-      return null;
-    }
-    return this.players.get(this.seatOrder[this.currentPlayerIndex]);
-  }
-
-  getTurnTimeRemaining() {
-    if (!this.turnStartTime) return this.turnTimeLimit;
-    const elapsed = Math.floor((Date.now() - this.turnStartTime) / 1000);
-    return Math.max(0, this.turnTimeLimit - elapsed);
-  }
-
-  handleTimeout() {
-    const player = this.getCurrentPlayer();
-    if (!player) return null;
-    return this.playerAction(player.id, 'fold');
-  }
-
-  playerAction(playerId, action, amount = 0) {
-    const player = this.players.get(playerId);
-    if (!player) return { success: false, message: '玩家不存在' };
-
-    const currentPlayer = this.getCurrentPlayer();
-    if (!currentPlayer || currentPlayer.id !== playerId) {
-      return { success: false, message: '还没轮到你' };
-    }
-
-    if (player.status !== PLAYER_STATUS.ACTIVE) {
-      return { success: false, message: '你已经弃牌或全下' };
-    }
-
-    let result;
-
-    switch (action) {
-      case 'fold':
-        result = this.fold(player);
-        break;
-      case 'check':
-        result = this.check(player);
-        break;
-      case 'call':
-        result = this.call(player);
-        break;
-      case 'raise':
-        result = this.raise(player, amount);
-        break;
-      case 'allin':
-        result = this.allIn(player);
-        break;
-      default:
-        return { success: false, message: '无效操作' };
-    }
-
-    if (result.success) {
-      this.roundHistory.push({
-        type: 'action',
-        playerId: player.id,
-        playerName: player.name,
-        action,
-        amount: result.amount || 0,
-      });
-
-      if (this.activeAndAllInPlayers.length <= 1) {
-        this.endRound();
-        return { ...result, roundEnded: true };
-      }
-
-      if (this.isBettingRoundComplete()) {
-        this.advancePhase();
-        if (this.phase === GAME_PHASES.SHOWDOWN) {
-          return { ...result, roundEnded: true };
-        }
-        return { ...result, phaseChanged: true, newPhase: this.phase };
-      }
-
-      this.nextPlayer();
-      this.turnStartTime = Date.now();
-    }
-
-    return result;
-  }
-
-  fold(player) {
-    player.status = PLAYER_STATUS.FOLDED;
-    return { success: true, action: 'fold' };
-  }
-
-  check(player) {
-    if (player.currentBet < this.currentBet) {
-      return { success: false, message: '你需要跟注或弃牌' };
-    }
-    return { success: true, action: 'check' };
-  }
-
-  call(player) {
-    const callAmount = Math.min(this.currentBet - player.currentBet, player.chips);
-    player.chips -= callAmount;
-    player.currentBet += callAmount;
-    player.totalBetThisRound += callAmount;
-    this.pot += callAmount;
-    if (player.chips === 0) player.status = PLAYER_STATUS.ALL_IN;
-    return { success: true, action: 'call', amount: callAmount };
-  }
-
-  raise(player, amount) {
-    const totalToCall = this.currentBet - player.currentBet;
-    const totalAmount = totalToCall + amount;
-
-    if (amount < this.minRaise && player.chips > totalAmount) {
-      return { success: false, message: `加注至少 ${this.minRaise}` };
-    }
-    if (totalAmount > player.chips) {
-      return { success: false, message: '筹码不足' };
-    }
-
-    player.chips -= totalAmount;
-    player.currentBet += totalAmount;
-    player.totalBetThisRound += totalAmount;
-    this.pot += totalAmount;
-    this.currentBet = player.currentBet;
-    this.minRaise = Math.max(this.minRaise, amount);
-    this.lastRaiserIndex = this.currentPlayerIndex;
-    if (player.chips === 0) player.status = PLAYER_STATUS.ALL_IN;
-    return { success: true, action: 'raise', amount: totalAmount };
-  }
-
-  allIn(player) {
-    const allInAmount = player.chips;
-    player.currentBet += allInAmount;
-    player.totalBetThisRound += allInAmount;
-    this.pot += allInAmount;
-    player.chips = 0;
-    player.status = PLAYER_STATUS.ALL_IN;
-
-    if (player.currentBet > this.currentBet) {
-      const raiseBy = player.currentBet - this.currentBet;
-      this.minRaise = Math.max(this.minRaise, raiseBy);
-      this.currentBet = player.currentBet;
-      this.lastRaiserIndex = this.currentPlayerIndex;
-    }
-    return { success: true, action: 'allin', amount: allInAmount };
-  }
-
-  nextPlayer() {
-    const numPlayers = this.seatOrder.length;
-    let nextIndex = (this.currentPlayerIndex + 1) % numPlayers;
-    let checked = 0;
-    while (checked < numPlayers) {
-      const player = this.players.get(this.seatOrder[nextIndex]);
-      if (player && player.status === PLAYER_STATUS.ACTIVE) {
-        this.currentPlayerIndex = nextIndex;
-        return;
-      }
-      nextIndex = (nextIndex + 1) % numPlayers;
-      checked++;
-    }
-  }
-
-  isBettingRoundComplete() {
-    const activePlayers = this.activePlayers;
-    if (activePlayers.length === 0) return true;
-    const allBetsEqual = activePlayers.every(p => p.currentBet === this.currentBet);
-    if (!allBetsEqual) return false;
-    const nextIndex = this.findNextActivePlayerIndex(this.currentPlayerIndex);
-    return nextIndex === this.lastRaiserIndex || nextIndex === -1;
-  }
-
-  findNextActivePlayerIndex(fromIndex) {
-    const numPlayers = this.seatOrder.length;
-    let nextIndex = (fromIndex + 1) % numPlayers;
-    let checked = 0;
-    while (checked < numPlayers) {
-      const player = this.players.get(this.seatOrder[nextIndex]);
-      if (player && player.status === PLAYER_STATUS.ACTIVE) {
-        return nextIndex;
-      }
-      nextIndex = (nextIndex + 1) % numPlayers;
-      checked++;
-    }
-    return -1;
-  }
-
-  advancePhase() {
-    for (const id of this.seatOrder) {
-      const player = this.players.get(id);
-      if (player) player.currentBet = 0;
-    }
-    this.currentBet = 0;
-    this.minRaise = this.bigBlind;
-
-    switch (this.phase) {
-      case GAME_PHASES.PRE_FLOP:
-        this.phase = GAME_PHASES.FLOP;
-        this.communityCards.push(...this.deck.dealMultiple(3));
-        break;
-      case GAME_PHASES.FLOP:
-        this.phase = GAME_PHASES.TURN;
-        this.communityCards.push(this.deck.deal());
-        break;
-      case GAME_PHASES.TURN:
-        this.phase = GAME_PHASES.RIVER;
-        this.communityCards.push(this.deck.deal());
-        break;
-      case GAME_PHASES.RIVER:
-        this.phase = GAME_PHASES.SHOWDOWN;
-        this.endRound();
-        return;
-    }
-
-    const numPlayers = this.seatOrder.length;
-    let startIdx = (this.dealerIndex + 1) % numPlayers;
-    let found = false;
-    for (let i = 0; i < numPlayers; i++) {
-      const idx = (startIdx + i) % numPlayers;
-      const player = this.players.get(this.seatOrder[idx]);
-      if (player && player.status === PLAYER_STATUS.ACTIVE) {
-        this.currentPlayerIndex = idx;
-        this.lastRaiserIndex = idx;
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
-      this.advancePhase();
-    } else {
-      this.turnStartTime = Date.now();
-    }
-  }
-
-  endRound() {
-    this.phase = GAME_PHASES.SHOWDOWN;
-    this.turnStartTime = null;
-    this.confirmedNextPlayers.clear();
-    const remaining = this.activeAndAllInPlayers;
-
-    // 标记是否为实际摊牌（多人对决）
-    this.isActualShowdown = remaining.length > 1;
-
-    let results;
-    if (remaining.length === 1) {
-      const winner = remaining[0];
-      winner.chips += this.pot;
-      results = [{
-        playerId: winner.id,
-        playerName: winner.name,
-        winAmount: this.pot,
-        hand: null,
-        handName: '其他玩家弃牌',
-      }];
-    } else {
-      results = this.calculateWinnings(remaining);
-    }
-
-    this.roundHistory.push({ type: 'showdown', results });
-    this.lastResults = results;
-    this.lastCommunityCards = [...this.communityCards];
-
-    return results;
-  }
-
-  calculateWinnings(contenders) {
-    // 计算每个玩家本轮的总投注（包含所有阶段）
-    // 使用 totalBetThisRound 来追踪
-    const allParticipants = this.seatOrder
-      .map(id => this.players.get(id))
-      .filter(p => p);
-
-    // 收集每个参与者的总投注
-    const playerBets = [];
-    for (const p of allParticipants) {
-      playerBets.push({ id: p.id, totalBet: p.totalBetThisRound, status: p.status });
-    }
-
-    // 计算边池：按总投注额从小到大排序，逐级切分
-    const sidePots = this._buildSidePots(playerBets);
-
-    // 评估还在对决中的玩家的牌力
-    const evaluatedPlayers = contenders.map(p => {
-      const allCards = [...p.holeCards, ...this.communityCards];
-      const hand = evaluateBestHand(allCards);
-      return { id: p.id, name: p.name, hand, holeCards: p.holeCards };
-    });
-
-    // 每个玩家的赢利
-    const winnings = {};
-    for (const ep of evaluatedPlayers) {
-      winnings[ep.id] = 0;
-    }
-
-    // 对每个边池分别决定赢家
-    for (const pot of sidePots) {
-      // 在该边池有资格竞争的玩家 = 在 contenders 中且在 eligible 列表中
-      const eligible = evaluatedPlayers.filter(ep => pot.eligible.has(ep.id));
-      if (eligible.length === 0) continue;
-
-      // 从有资格的玩家中决出赢家
-      const potWinners = determineWinners(
-        eligible.map(ep => ({
-          id: ep.id,
-          cards: [...ep.holeCards, ...this.communityCards],
-        }))
-      );
-
-      const winPerPlayer = Math.floor(pot.amount / potWinners.length);
-      const remainder = pot.amount - winPerPlayer * potWinners.length;
-
-      for (let i = 0; i < potWinners.length; i++) {
-        let amt = winPerPlayer;
-        if (i === 0) amt += remainder;
-        winnings[potWinners[i].id] += amt;
-      }
-    }
-
-    // 分配筹码并构建结果
-    const results = [];
-    for (const ep of evaluatedPlayers) {
-      const player = this.players.get(ep.id);
-      const amount = winnings[ep.id] || 0;
-      if (amount > 0) {
-        player.chips += amount;
-      }
-      results.push({
-        playerId: ep.id,
-        playerName: ep.name,
-        winAmount: amount,
-        hand: ep.hand,
-        handName: ep.hand.name,
-        holeCards: ep.holeCards,
-      });
-    }
-
-    return results;
-  }
-
-  /**
-   * 构建边池列表
-   * 标准算法：按投注额从小到大依次"切"出边池
-   * 返回: [{ amount, eligible: Set<playerId> }, ...]
-   */
-  _buildSidePots(playerBets) {
-    // 过滤掉投注为0的（纯旁观者）
-    const bets = playerBets
-      .filter(pb => pb.totalBet > 0)
-      .map(pb => ({ ...pb }));
-
-    if (bets.length === 0) return [];
-
-    // 按总投注额排序
-    bets.sort((a, b) => a.totalBet - b.totalBet);
-
-    const pots = [];
-    let prevLevel = 0;
-
-    for (let i = 0; i < bets.length; i++) {
-      const currentLevel = bets[i].totalBet;
-      const diff = currentLevel - prevLevel;
-
-      if (diff > 0) {
-        // 从所有投注额 >= currentLevel 的玩家处各收 diff
-        const eligible = new Set();
-        let potAmount = 0;
-        for (const b of bets) {
-          if (b.totalBet >= currentLevel) {
-            potAmount += diff;
-            eligible.add(b.id);
-          }
-        }
-        // 只有未弃牌的玩家才有资格赢
-        const activeEligible = new Set();
-        for (const id of eligible) {
-          const p = this.players.get(id);
-          if (p && (p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.ALL_IN)) {
-            activeEligible.add(id);
-          }
-        }
-        // 如果没有活跃玩家有资格，把筹码给投入最多的活跃玩家
-        if (activeEligible.size > 0) {
-          pots.push({ amount: potAmount, eligible: activeEligible });
-        } else {
-          // 理论上不会出现，但兜底：给第一个活跃玩家
-          const fallback = bets.find(b => {
-            const p = this.players.get(b.id);
-            return p && (p.status === PLAYER_STATUS.ACTIVE || p.status === PLAYER_STATUS.ALL_IN);
-          });
-          if (fallback) {
-            pots.push({ amount: potAmount, eligible: new Set([fallback.id]) });
-          }
-        }
-      }
-      prevLevel = currentLevel;
-    }
-
-    return pots;
-  }
-
-  // 玩家确认下一局
-  playerConfirmNext(playerId) {
-    if (this.phase !== GAME_PHASES.SHOWDOWN) {
-      return { success: false, message: '当前不在结算阶段' };
-    }
-    if (!this.players.has(playerId)) {
-      return { success: false, message: '玩家不存在' };
-    }
-    this.confirmedNextPlayers.add(playerId);
-    return { success: true };
-  }
-
-  // 是否所有人都确认了
-  get allConfirmedNext() {
-    if (this.phase !== GAME_PHASES.SHOWDOWN) return false;
-    for (const [id] of this.players) {
-      if (!this.confirmedNextPlayers.has(id)) return false;
-    }
-    return this.players.size >= 1;
-  }
-
-  // 玩家确认总结
-  playerConfirmSettlement(playerId) {
-    if (this.phase !== GAME_PHASES.SETTLED) {
-      return { success: false, message: '当前不在总结阶段' };
-    }
-    if (!this.players.has(playerId)) {
-      return { success: false, message: '玩家不存在' };
-    }
-    this.confirmedSettlement.add(playerId);
-    return { success: true };
-  }
-
-  // 检查是否所有人都确认了总结
-  get allConfirmedSettlement() {
-    if (this.phase !== GAME_PHASES.SETTLED) return false;
-    for (const [id] of this.players) {
-      if (!this.confirmedSettlement.has(id)) return false;
-    }
-    return this.players.size >= 1;
-  }
-
-  prepareNextRound() {
-    if (this.currentRound >= this.maxRounds) {
-      this.phase = GAME_PHASES.SETTLED;
-      this.confirmedSettlement.clear();
-      return false;
-    }
-
-    this.communityCards = [];
-    this.pot = 0;
-    this.sidePots = [];
-    this.currentBet = 0;
-    this.currentPlayerIndex = -1;
-    this.lastResults = null;
-    this.sbSeatIndex = -1;
-    this.bbSeatIndex = -1;
-    this.confirmedNextPlayers.clear();
-
-    for (const [, player] of this.players) {
-      player.reset();
-      player.isReady = true;
-    }
-
+    this.roundHistory.push({ type: 'blinds', smallBlind: { playerId: participants[sb].id, amount: participants[sb].currentBet }, bigBlind: { playerId: participants[bb].id, amount: participants[bb].currentBet } });
+    this.pending = new Set(this.activePlayers.map(p => p.id));
+    this.progress(bb);
     return true;
   }
-
-  // 重购积分
-  playerRebuy(playerId) {
-    const player = this.players.get(playerId);
-    if (!player) return { success: false, message: '玩家不存在' };
-    return player.rebuy();
+  commit(p, amount) {
+    p.chips -= amount; p.currentBet += amount; p.totalBetThisRound += amount; this.pot += amount;
+    if (p.chips === 0) p.status = 'all_in';
   }
-
-  // 获取结算数据
-  getSettlement() {
-    const settlement = [];
-    for (const [, player] of this.players) {
-      const profit = player.chips - player.totalBuyIn;
-      settlement.push({
-        id: player.id,
-        name: player.name,
-        seatIndex: player.seatIndex,
-        finalChips: player.chips,
-        totalBuyIn: player.totalBuyIn,
-        profit,
-      });
-    }
-    settlement.sort((a, b) => b.profit - a.profit);
-    return settlement;
+  getCurrentPlayer() { return this.isLive ? this.players.get(this.seatOrder[this.currentPlayerIndex]) || null : null; }
+  getTurnTimeRemaining() { return this.turnStartTime === null ? 0 : Math.max(0, this.turnTimeLimit - Math.floor((Date.now() - this.turnStartTime) / 1000)); }
+  callAmount(p) {
+    let target = this.currentBet;
+    if (this.activePlayers.length === 1) target = Math.min(target, Math.max(0, ...this.activeAndAllInPlayers.filter(q => q.id !== p.id).map(q => q.currentBet)));
+    return Math.min(p.chips, Math.max(0, target - p.currentBet));
   }
-
-  // 重新开始整场比赛
-  restartGame() {
-    this.currentRound = 0;
-    this.dealerIndex = -1;
-    this.isGameStarted = false;
-    this.phase = GAME_PHASES.WAITING;
-    this.communityCards = [];
-    this.pot = 0;
-    this.lastResults = null;
-    this.sbSeatIndex = -1;
-    this.bbSeatIndex = -1;
-    this.confirmedNextPlayers.clear();
-    this.confirmedSettlement.clear();
-
-    for (const [, player] of this.players) {
-      player.chips = INITIAL_CHIPS;
-      player.totalBuyIn = INITIAL_CHIPS;
-      player.holeCards = [];
-      player.currentBet = 0;
-      player.totalBetThisRound = 0;
-      player.status = PLAYER_STATUS.ACTIVE;
-      player.isReady = false;
-    }
+  canRaise(p) {
+    if (this.activePlayers.length < 2 || p.chips <= this.currentBet - p.currentBet) return false;
+    const previous = this.actedAtBet.get(p.id);
+    return previous === undefined || previous === 0 || this.currentBet - previous >= this.minRaise;
   }
-
-  getAvailableActions(playerId) {
-    const player = this.players.get(playerId);
-    if (!player || player.status !== PLAYER_STATUS.ACTIVE) return [];
-
-    const currentPlayer = this.getCurrentPlayer();
-    if (!currentPlayer || currentPlayer.id !== playerId) return [];
-
-    const actions = ['fold'];
-    const callAmount = this.currentBet - player.currentBet;
-
-    if (callAmount === 0) {
-      actions.push('check');
-    } else {
-      actions.push('call');
-    }
-
-    if (player.chips > callAmount) {
-      actions.push('raise');
-    }
-
-    actions.push('allin');
+  raiseBounds(p) {
+    return { min: Math.max(this.bigBlind, this.currentBet + (this.currentBet >= this.bigBlind ? this.minRaise : 0)), max: p.currentBet + p.chips };
+  }
+  getAvailableActions(id) {
+    const p = this.players.get(id);
+    if (!this.isLive || !p || p.status !== 'active' || this.getCurrentPlayer()?.id !== id || !p.isConnected) return [];
+    const call = this.callAmount(p), actions = ['fold', call > 0 ? 'call' : 'check'];
+    if (this.canRaise(p) && this.raiseBounds(p).max >= this.raiseBounds(p).min) actions.push('raise');
+    if (p.chips <= call || this.canRaise(p)) actions.push('allin');
     return actions;
   }
-
-  getState(forPlayerId = null) {
-    const players = [];
-    for (const [id, player] of this.players) {
-      const isShowdown = this.phase === GAME_PHASES.SHOWDOWN;
-      const isSelf = id === forPlayerId;
-      // 亮牌规则：自己的牌始终可见；摊牌阶段只有实际对决（多人）时才亮牌，且已弃牌的不亮
-      const revealCards = isSelf || (isShowdown && this.isActualShowdown && player.status !== PLAYER_STATUS.FOLDED);
-      const pJson = player.toJSON(revealCards);
-      // 在 SHOWDOWN 时标记该玩家是否已确认下一局
-      if (isShowdown) {
-        pJson.confirmedNext = this.confirmedNextPlayers.has(id);
-      }
-      players.push(pJson);
+  playerAction(id, action, amount = 0, expectedTurn = null) {
+    if (!this.isLive) return fail('本手已结束或尚未开始');
+    if (expectedTurn !== null && expectedTurn !== this.turnId) return fail('牌局已更新，请按当前牌局操作');
+    const p = this.players.get(id);
+    if (!p || this.getCurrentPlayer()?.id !== id) return fail('还没轮到你');
+    if (p.status !== 'active') return fail('你已经弃牌或全下');
+    const available = this.getAvailableActions(id);
+    if (!available.includes(action)) return fail('当前不能执行此操作');
+    const beforeBet = this.currentBet, beforePhase = this.phase, beforePot = this.pot;
+    let paid = 0;
+    if (action === 'raise') {
+      // The wire amount remains the increment above the table's current bet.
+      if (!Number.isSafeInteger(amount) || amount <= 0) return fail('加注金额必须为正整数');
+      const target = beforeBet + amount, bounds = this.raiseBounds(p);
+      if (target < bounds.min || target > bounds.max) return fail(`加注到 ${bounds.min}–${bounds.max} 之间`);
+      paid = target - p.currentBet;
+    } else if (action === 'call') paid = this.callAmount(p);
+    else if (action === 'allin') paid = p.chips;
+    if (action === 'fold') p.status = 'folded';
+    else if (paid) this.commit(p, paid);
+    this.pending.delete(id); this.actedAtBet.set(id, Math.max(beforeBet, p.currentBet));
+    if (p.currentBet > beforeBet) {
+      const increase = p.currentBet - beforeBet;
+      const fullRaise = beforeBet < this.bigBlind ? p.currentBet >= this.bigBlind : increase >= this.minRaise;
+      this.currentBet = p.currentBet;
+      if (fullRaise) this.minRaise = beforeBet < this.bigBlind ? p.currentBet : increase;
+      for (const q of this.activePlayers) if (q.id !== id && q.currentBet < this.currentBet) this.pending.add(q.id);
     }
-
-    const currentPlayer = this.getCurrentPlayer();
-    const dealerPlayer = this.seatOrder.length > 0
-      ? this.players.get(this.seatOrder[this.dealerIndex])
-      : null;
-
+    this.roundHistory.push({ type: 'action', handId: this.handId, phase: beforePhase, playerId: id, playerName: p.name, action, amount: paid, betBefore: beforeBet, betTo: p.currentBet, potBefore: beforePot });
+    this.touch(); this.progress(this.currentPlayerIndex);
+    return { success: true, action, amount: paid, phaseChanged: this.phase !== beforePhase, newPhase: this.phase, roundEnded: this.phase === 'showdown' };
+  }
+  handleTimeout() {
+    const p = this.getCurrentPlayer(); if (!p) return null;
+    return this.playerAction(p.id, this.callAmount(p) === 0 ? 'check' : 'fold');
+  }
+  progress(fromIndex) {
+    // All automatic transitions are synchronous; the server schedules only the next actor.
+    for (let guard = 0; guard < 100 && this.isLive; guard++) {
+      const live = this.activeAndAllInPlayers, active = this.activePlayers;
+      if (live.length <= 1) { this.endRound(); return; }
+      if (!active.length || (active.length === 1 && this.callAmount(active[0]) === 0)) { this.runOut(); return; }
+      for (const id of this.pending) if (!active.some(p => p.id === id)) this.pending.delete(id);
+      if (!this.pending.size) {
+        if (active.some(p => p.currentBet < this.currentBet)) throw new Error('Unmatched bet without pending action');
+        if (this.phase === 'river') { this.endRound(); return; }
+        this.advanceStreet(); fromIndex = this.dealerIndex; continue;
+      }
+      const n = this.seatOrder.length;
+      let p;
+      for (let i = 1; i <= n; i++) {
+        const idx = ((fromIndex + i) % n + n) % n;
+        if (this.pending.has(this.seatOrder[idx])) { this.currentPlayerIndex = idx; p = this.players.get(this.seatOrder[idx]); break; }
+      }
+      if (!p) throw new Error('Pending action has no seated player');
+      if (!p.isConnected || p.departed) {
+        const action = this.callAmount(p) === 0 ? 'check' : 'fold';
+        if (action === 'fold') p.status = 'folded';
+        this.pending.delete(p.id); this.actedAtBet.set(p.id, this.currentBet);
+        this.roundHistory.push({ type: 'action', handId: this.handId, phase: this.phase, playerId: p.id, playerName: p.name, action, amount: 0, automatic: true, potBefore: this.pot });
+        this.touch(); fromIndex = this.currentPlayerIndex; continue;
+      }
+      this.turnStartTime = Date.now(); return;
+    }
+    if (this.isLive) throw new Error('Automatic transition limit reached');
+  }
+  advanceStreet() {
+    for (const id of this.seatOrder) this.players.get(id).currentBet = 0;
+    this.currentBet = 0; this.minRaise = this.bigBlind; this.actedAtBet.clear();
+    if (this.phase === 'pre_flop') { this.phase = 'flop'; this.communityCards.push(...this.deck.dealMultiple(3)); }
+    else if (this.phase === 'flop') { this.phase = 'turn'; this.communityCards.push(this.deck.deal()); }
+    else if (this.phase === 'turn') { this.phase = 'river'; this.communityCards.push(this.deck.deal()); }
+    this.pending = new Set(this.activePlayers.map(p => p.id)); this.touch();
+  }
+  runOut() {
+    while (this.communityCards.length < 5) this.communityCards.push(this.deck.deal());
+    this.endRound();
+  }
+  endRound() {
+    if (!this.isLive) return this.lastResults; // Exactly once, even after duplicate callbacks.
+    const remaining = this.activeAndAllInPlayers;
+    if (!remaining.length) throw new Error('No contender to settle');
+    const contributors = this.seatOrder.map(id => this.players.get(id));
+    this.isActualShowdown = remaining.length > 1;
+    if (this.isActualShowdown && this.communityCards.length !== 5) throw new Error('Incomplete showdown board');
+    const results = new Map(remaining.map(p => {
+      const hand = this.isActualShowdown ? evaluateBestHand([...p.holeCards, ...this.communityCards]) : null;
+      return [p.id, { playerId: p.id, playerName: p.name, seatIndex: p.seatIndex, winAmount: 0, returnedAmount: 0,
+        hand: hand ? { ...hand, cards: hand.cards.map(cardJSON) } : null, handName: hand?.name || '其他玩家弃牌',
+        holeCards: this.isActualShowdown ? p.holeCards.map(cardJSON) : [] }];
+    }));
+    this.lastPot = this.pot; this.sidePots = [];
+    const levels = [...new Set(contributors.map(p => p.totalBetThisRound).filter(v => v > 0))].sort((a, b) => a - b);
+    let previous = 0;
+    for (const level of levels) {
+      const payers = contributors.filter(p => p.totalBetThisRound >= level);
+      const amount = (level - previous) * payers.length; previous = level;
+      if (payers.length === 1) {
+        const p = payers[0]; p.chips += amount; this.pot -= amount;
+        if (!results.has(p.id)) results.set(p.id, { playerId: p.id, playerName: p.name, seatIndex: p.seatIndex, winAmount: 0, returnedAmount: 0, hand: null, handName: '未被跟注部分退回', holeCards: [] });
+        results.get(p.id).returnedAmount += amount; continue;
+      }
+      let eligible = remaining.filter(p => p.totalBetThisRound >= level);
+      if (!eligible.length || remaining.length === 1) eligible = remaining;
+      const best = eligible.reduce((a, p) => !a || (this.isActualShowdown && compareHands(results.get(p.id).hand, results.get(a.id).hand) > 0) ? p : a, null);
+      const winners = eligible.filter(p => !this.isActualShowdown || compareHands(results.get(p.id).hand, results.get(best.id).hand) === 0)
+        .sort((a, b) => ((a.seatIndex - this.dealerSeat + MAX_PLAYERS - 1) % MAX_PLAYERS) - ((b.seatIndex - this.dealerSeat + MAX_PLAYERS - 1) % MAX_PLAYERS));
+      const each = Math.floor(amount / winners.length), odd = amount % winners.length;
+      const awards = winners.map((p, i) => { const won = each + (i < odd ? 1 : 0); p.chips += won; results.get(p.id).winAmount += won; return { playerId: p.id, amount: won }; });
+      this.sidePots.push({ amount, eligiblePlayerIds: eligible.map(p => p.id), awards }); this.pot -= amount;
+    }
+    if (this.pot !== 0) throw new Error('Settlement did not conserve chips');
+    this.lastResults = [...results.values()]; this.phase = 'showdown'; this.pending.clear(); this.currentPlayerIndex = -1; this.turnStartTime = null;
+    this.confirmedNextPlayers.clear(); this.touch();
+    this.roundHistory.push({ type: 'showdown', results: this.lastResults });
+    for (const p of contributors) if (p.departed) this.archivePlayer(p);
+    return this.lastResults;
+  }
+  get confirmationPlayers() { return [...this.players.values()].filter(p => p.isConnected && !p.departed && this.handParticipants.has(p.id)); }
+  playerConfirmNext(id) {
+    if (this.phase !== 'showdown' || !this.players.has(id)) return fail('当前无法确认下一手');
+    this.confirmedNextPlayers.add(id); return { success: true };
+  }
+  get allConfirmedNext() { return this.phase === 'showdown' && this.confirmationPlayers.every(p => this.confirmedNextPlayers.has(p.id)); }
+  playerConfirmSettlement(id) {
+    if (this.phase !== 'settled' || !this.players.has(id)) return fail('当前无法确认总结');
+    this.confirmedSettlement.add(id); return { success: true };
+  }
+  get allConfirmedSettlement() { return this.phase === 'settled' && [...this.players.values()].filter(p => p.isConnected && !p.departed).every(p => this.confirmedSettlement.has(p.id)); }
+  prepareNextRound() {
+    if (!this.allConfirmedNext) return false;
+    if (this.currentRound >= this.maxRounds) { this.phase = 'settled'; this.confirmedSettlement.clear(); this.touch(); return false; }
+    return true;
+  }
+  playerRebuy(id) {
+    if (this.isLive || this.phase === 'settled') return fail('请在两手之间重购');
+    const p = this.players.get(id); if (!p || p.chips > 0) return fail('当前无需重购');
+    p.chips = 1000; p.totalBuyIn += 1000; p.isReady = true;
+    return { success: true, amount: 1000 };
+  }
+  getSettlement() {
+    return [...this.departedPlayers.values(), ...[...this.players.values()].map(p => ({ id: p.id, name: p.name, seatIndex: p.seatIndex, finalChips: p.chips, totalBuyIn: p.totalBuyIn, profit: p.chips - p.totalBuyIn }))].sort((a, b) => b.profit - a.profit);
+  }
+  restartGame() {
+    if (this.phase !== 'settled' || !this.allConfirmedSettlement) return fail('需全员确认总结后再开始');
+    this.phase = 'waiting'; this.currentRound = 0; this.isGameStarted = false; this.dealerSeat = -1; this.dealerIndex = -1;
+    this.communityCards = []; this.pot = 0; this.lastPot = 0; this.lastResults = null; this.sidePots = []; this.roundHistory = [];
+    this.currentBet = 0; this.minRaise = this.bigBlind; this.pending.clear(); this.actedAtBet.clear(); this.seatOrder = []; this.handParticipants.clear();
+    this.confirmedNextPlayers.clear(); this.confirmedSettlement.clear(); this.departedPlayers.clear(); this.turnStartTime = null;
+    this.sbSeatIndex = -1; this.bbSeatIndex = -1;
+    for (const p of this.players.values()) { p.chips = 1000; p.totalBuyIn = 1000; p.isReady = p.isBot; p.reset(); }
+    this.touch(); return { success: true };
+  }
+  getState(forPlayerId = null) {
+    const me = this.players.get(forPlayerId), showdown = ['showdown', 'settled'].includes(this.phase);
+    const players = [...this.players.values()].filter(p => !p.departed).map(p => ({
+      ...p.toJSON(p.id === forPlayerId || (showdown && this.isActualShowdown && ['active', 'all_in'].includes(p.status))),
+      confirmedNext: this.confirmedNextPlayers.has(p.id), confirmedSettlement: this.confirmedSettlement.has(p.id),
+    }));
+    const bounds = me ? this.raiseBounds(me) : { min: 0, max: 0 };
     return {
-      roomId: this.roomId,
-      phase: this.phase,
-      players,
-      communityCards: this.communityCards.map(c => c.toJSON()),
-      pot: this.pot,
-      currentBet: this.currentBet,
-      dealerIndex: this.dealerIndex,
-      dealerSeat: dealerPlayer?.seatIndex ?? -1,
-      sbSeat: this.sbSeatIndex,
-      bbSeat: this.bbSeatIndex,
-      currentPlayerId: currentPlayer?.id || null,
-      currentPlayerSeat: currentPlayer?.seatIndex ?? -1,
-      smallBlind: this.smallBlind,
-      bigBlind: this.bigBlind,
-      availableActions: forPlayerId ? this.getAvailableActions(forPlayerId) : [],
-      minRaise: this.minRaise,
-      callAmount: forPlayerId
-        ? Math.max(0, this.currentBet - (this.players.get(forPlayerId)?.currentBet || 0))
-        : 0,
-      lastResults: this.lastResults || null,
-      playerCount: this.players.size,
-      maxPlayers: MAX_PLAYERS,
-      currentRound: this.currentRound,
-      maxRounds: this.maxRounds,
-      isGameStarted: this.isGameStarted,
-      turnTimeRemaining: this.getTurnTimeRemaining(),
-      turnTimeLimit: this.turnTimeLimit,
-      settlement: this.phase === GAME_PHASES.SETTLED ? this.getSettlement() : null,
-      canRebuy: forPlayerId
-        ? (this.players.get(forPlayerId)?.chips === 0
-          && (this.phase === GAME_PHASES.WAITING || this.phase === GAME_PHASES.SHOWDOWN || this.phase === GAME_PHASES.SETTLED))
-        : false,
-      confirmedCount: this.confirmedNextPlayers.size,
-      totalPlayerCount: this.players.size,
-      isActualShowdown: this.isActualShowdown,
+      protocolVersion: 2, roomId: this.roomId, youId: forPlayerId, hostPlayerId: this.hostPlayerId, handId: this.handId, revision: this.revision, turnId: this.turnId,
+      phase: this.phase, players, communityCards: this.communityCards.map(cardJSON), pot: showdown ? this.lastPot : this.pot, potAwarded: showdown, sidePots: showdown ? this.sidePots : [],
+      currentBet: this.currentBet, dealerIndex: this.dealerIndex, dealerSeat: this.dealerSeat, sbSeat: this.sbSeatIndex, bbSeat: this.bbSeatIndex,
+      currentPlayerId: this.getCurrentPlayer()?.id || null, currentPlayerSeat: this.getCurrentPlayer()?.seatIndex ?? -1,
+      smallBlind: this.smallBlind, bigBlind: this.bigBlind, availableActions: this.getAvailableActions(forPlayerId),
+      minRaise: Math.max(0, bounds.min - this.currentBet), minRaiseTo: bounds.min, maxRaiseTo: bounds.max, callAmount: me ? this.callAmount(me) : 0,
+      lastResults: showdown ? this.lastResults : null, playerCount: this.playerCount, maxPlayers: MAX_PLAYERS,
+      currentRound: this.currentRound, maxRounds: this.maxRounds, isGameStarted: this.isGameStarted,
+      turnTimeRemaining: this.getTurnTimeRemaining(), turnTimeLimit: this.turnTimeLimit,
+      settlement: this.phase === 'settled' ? this.getSettlement() : null,
+      canRebuy: !!me && me.chips === 0 && ['waiting', 'showdown'].includes(this.phase),
+      confirmedCount: this.confirmationPlayers.filter(p => this.confirmedNextPlayers.has(p.id)).length, totalPlayerCount: this.confirmationPlayers.length,
+      confirmedSettlement: [...this.confirmedSettlement], allConfirmedSettlement: this.allConfirmedSettlement, isActualShowdown: this.isActualShowdown,
     };
   }
 }
-
-module.exports = { Game, GAME_PHASES, PLAYER_STATUS, MAX_PLAYERS };
+module.exports = { Game, Player, GAME_PHASES, PLAYER_STATUS, MAX_PLAYERS };
